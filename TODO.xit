@@ -1,0 +1,30 @@
+Refactor Llama and LLM
+[ ] Replace llama.Options with functional Options.
+    Functional options are more idiomatic for Go and lets us add better validation and abstraction.
+[ ] Break apart llm and llama
+    llm should be a package that generalizes using a large language model to predict text.
+    llama should be a package that supports llama models and their specific needs / features.
+[ ] Expose the EOL and EOS tokens from the llama Interface
+    When writing a prediction handler which can terminate a prediction, knowing when an "EOL" is predicted can be
+    a useful signal to stop.  Simply adding EOL as a stop token does not work well.
+[ ] Support for terminating predictions from Go.
+    The prediction type should have a method that can be used to terminate prediction.
+
+Catch up on GGUF Changes
+[ ] Catch up to llama.cpp after their beta changes by only supporting loading GGUF for Llama. (We are currently on 
+    dadbed99e65252d79f81101a392d0d6497b86caa)
+[ ] Add support for GGUF to Llama
+
+Explore Adding RWKV
+[ ] Add RWKV as an LLM implementation alternate to Llama.  This uses GGML and is really pretty similar to llama.cpp,
+    but having a second implemenation might keep the llm package from being the llama package in a fancy coat.
+
+Support Better Output Constraints
+[ ] GBNF grammars provide a different way to constrain predicted output to a required format.
+[ ] Implement support for writing output constraints in Go.
+
+Add NATS Example
+[ ] Add a clean NATS example server, like io-worker, that shows how to run llama models on multiple hosts as backends
+    for a API / UI server.  Mimicking one of the other llama servers used by open source UIs and would make for a
+    better demo.
+
