@@ -6,9 +6,10 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"strings"
 	"time"
 
+	"github.com/swdunlop/llm-go"
+	"github.com/swdunlop/llm-go/configuration"
 	"github.com/swdunlop/llm-go/llama"
 )
 
@@ -26,24 +27,19 @@ func runWorker() error {
 	go func() { <-ctx.Done(); os.Stdin.Close() }()
 	enc := json.NewEncoder(os.Stdout)
 	dec := json.NewDecoder(os.Stdin)
-	options := llama.DefaultOptions()
-	enc.Encode(options)
-	llm, err := llama.New(os.Args[1], nil, &options)
+	model, err := llama.New(configuration.Map{
+		"model": {os.Args[1]},
+	})
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if llm != nil {
-			llm.Close()
-		}
-	}()
+	defer model.Release()
 	for {
 		var req Request
-		req.Options = options
 		err := dec.Decode(&req)
 		switch err {
 		case nil:
-			ret := process(ctx, enc, llm, &req)
+			ret := process(ctx, enc, model, &req)
 			err := enc.Encode(ret)
 			if err != nil {
 				return err
@@ -59,7 +55,7 @@ func runWorker() error {
 	}
 }
 
-func process(ctx context.Context, enc *json.Encoder, llm llama.Interface, req *Request) (rsp *Response) {
+func process(ctx context.Context, enc *json.Encoder, model llm.Predictor, req *Request) (rsp *Response) {
 	rsp = new(Response)
 	start := time.Now()
 	var err error
@@ -69,33 +65,20 @@ func process(ctx context.Context, enc *json.Encoder, llm llama.Interface, req *R
 			rsp.Error = err.Error()
 		}
 	}()
-	system := llm.Encode(req.System)
-	if req.Options.NumKeep < 0 {
-		req.Options.NumKeep = len(system)
-	}
-	response := make([]string, 0, 256)
-	prompt := append(system, llm.Encode(req.Prompt)...)
-	if len(prompt) == 0 {
-		rsp.Error = "missing prompt and system"
-		return
-	}
-	// TODO(swdunlop): correct truncated prompt to the next newline to avoid orphan tokens.
-	llm.Predict(ctx, prompt, func(p *llama.Prediction) {
-		if len(p.Response) > 0 {
-			enc.Encode(p.Response)
-			response = append(response, p.Response)
+	rsp.Response, err = model.Predict(ctx, req.Prompt, func(p llm.Prediction) error {
+		str := p.String()
+		if str != "" {
+			enc.Encode(str)
 		}
+		return nil
 	})
-	rsp.Response = strings.Join(response, "")
 	return
 }
 
-type interrupted struct{}
-
 type Request struct {
-	System  string        `json:"system"`  // the tokens from system are always used.
-	Prompt  string        `json:"prompt"`  // the tokens from prompt are used, preferring the later ones.
-	Options llama.Options `json:"options"` // options for generation, model options are ignored.
+	System string `json:"system"` // the tokens from system are always used.
+	Prompt string `json:"prompt"` // the tokens from prompt are used, preferring the later ones.
+	// TODO(swdunlop): add options
 }
 
 type Response struct {

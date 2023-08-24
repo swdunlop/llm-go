@@ -97,14 +97,50 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 	"unsafe"
+
+	"github.com/pbnjay/memory"
+	"github.com/swdunlop/llm-go"
+	"github.com/swdunlop/llm-go/configuration"
 )
+
+// Init configure things in llama.cpp that are not specific to the llama interface, specifically `LLAMA_USE_NUMA`.  If
+// you want to override runtime defaults, you should call this before calling other functions in this package.
+func Init(cf configuration.Interface) error {
+	initOnce.Do(func() {
+		if cf == nil {
+			cf = configuration.Environment(`LLAMA_`)
+		}
+		cf = configuration.Overlay{cf, configuration.Map{
+			`use_numa`: {`true`},
+		}}
+		var useNuma bool
+		err := configuration.Get(&useNuma, cf, `use_numa`)
+		if err != nil {
+			initError = err
+			return
+		}
+		C.llama_backend_init(C.bool(useNuma))
+		defaultParams = C.llama_context_default_params()
+		ncpu = numCPU()
+	})
+	return initError
+}
+
+var initOnce sync.Once
+var initError error
+var ncpu = 0
+var defaultParams C.struct_llama_context_params
 
 //go:embed ggml-metal.metal
 var fs embed.FS
+
+func init() { llm.RegisterPredictor(`llama`, New) }
 
 const modelFamilyLlama modelFamily = "llama"
 
@@ -234,55 +270,20 @@ type llama struct {
 	Options
 }
 
-func DefaultOptions() Options {
-	return Options{
-		Seed: -1,
-
-		UseNUMA: false,
-
-		NumCtx:             2048,
-		NumKeep:            -1,
-		NumBatch:           512,
-		NumGPU:             1,
-		NumGQA:             1,
-		LowVRAM:            false,
-		F16KV:              true,
-		UseMMap:            true,
-		UseMLock:           false,
-		RopeFrequencyBase:  10000.0,
-		RopeFrequencyScale: 1.0,
-		EmbeddingOnly:      true,
-
-		RepeatLastN:      64,
-		RepeatPenalty:    1.1,
-		FrequencyPenalty: 0.0,
-		PresencePenalty:  0.0,
-		Temperature:      0.8,
-		TopK:             40,
-		TopP:             0.9,
-		TFSZ:             1.0,
-		TypicalP:         1.0,
-		Mirostat:         0,
-		MirostatTau:      5.0,
-		MirostatEta:      0.1,
-		PenalizeNewline:  true,
-
-		NumThread: runtime.NumCPU(),
-	}
-}
-
 type Options struct {
+	Model    string   `json:"model,omitempty"`
+	Adapters []string `json:"adapters,omitempty"`
+
 	Seed int `json:"seed,omitempty"`
 
 	// Backend options
 	UseNUMA bool `json:"numa,omitempty"`
 
 	// Model options
-	NumCtx             int     `json:"num_ctx,omitempty"`
-	NumKeep            int     `json:"num_keep,omitempty"`
-	NumBatch           int     `json:"num_batch,omitempty"`
-	NumGQA             int     `json:"num_gqa,omitempty"`
-	NumGPU             int     `json:"num_gpu,omitempty"`
+	NumCtx             int     `json:"n_ctx,omitempty"`
+	NumBatch           int     `json:"n_batch,omitempty"`
+	NumGQA             int     `json:"n_gqa,omitempty"`
+	NumGPU             int     `json:"n_gpu,omitempty"`
 	MainGPU            int     `json:"main_gpu,omitempty"`
 	LowVRAM            bool    `json:"low_vram,omitempty"`
 	F16KV              bool    `json:"f16_kv,omitempty"`
@@ -291,10 +292,11 @@ type Options struct {
 	UseMMap            bool    `json:"use_mmap,omitempty"`
 	UseMLock           bool    `json:"use_mlock,omitempty"`
 	EmbeddingOnly      bool    `json:"embedding_only,omitempty"`
-	RopeFrequencyBase  float32 `json:"rope_frequency_base,omitempty"`
-	RopeFrequencyScale float32 `json:"rope_frequency_scale,omitempty"`
+	RopeFrequencyBase  float32 `json:"rope_freq_base,omitempty"`
+	RopeFrequencyScale float32 `json:"rope_freq_scale,omitempty"`
 
 	// Predict options
+	NumKeep          int      `json:"num_keep,omitempty"`
 	RepeatLastN      int      `json:"repeat_last_n,omitempty"`
 	RepeatPenalty    float32  `json:"repeat_penalty,omitempty"`
 	FrequencyPenalty float32  `json:"frequency_penalty,omitempty"`
@@ -310,16 +312,127 @@ type Options struct {
 	PenalizeNewline  bool     `json:"penalize_newline,omitempty"`
 	Stop             []string `json:"stop,omitempty"`
 
-	NumThread int `json:"num_thread,omitempty"`
+	NumThread int `json:"n_threads,omitempty"`
 }
 
-func newLlama(model string, adapters []string, opts *Options) (*llama, error) {
-	if _, err := os.Stat(model); err != nil {
+// RuntimeDefault provides a default configuration for llama based on the runtime environment.
+func RuntimeDefault() configuration.Interface {
+	cf := Default()
+	if runtime.GOOS == `darwin` && runtime.GOARCH == `arm64` {
+		// we only want 1 thread per performance core on Apple Silicon, leave the efficiency cores alone
+
+	}
+	cf[`n_threads`] = []string{strconv.Itoa(ncpu)}
+	return cf
+}
+
+// Default provides a default configuration for llama that omits runtime-specific settings.
+func Default() configuration.Map {
+	f := func(v any) []string { return []string{fmt.Sprint(v)} }
+	return configuration.Map{
+		`seed`:         {`-1`}, // Not f(defaultParams.seed),
+		`n_ctx`:        f(defaultParams.n_ctx),
+		`n_batch`:      f(defaultParams.n_batch),
+		`n_gpu_layers`: f(defaultParams.n_gpu_layers),
+		`n_gqa`:        f(defaultParams.n_gqa),
+		// TODO: add rms_norm_eps
+		// TODO: add tensor_split
+		`low_vram`: f(defaultParams.low_vram),
+		// TODO: add mul_mat_q
+		`f16kv`: f(defaultParams.f16_kv),
+		// TODO: add logits_all
+		`rope_freq_base`:  f(defaultParams.rope_freq_base),
+		`rope_freq_scale`: f(defaultParams.rope_freq_scale),
+		// TODO: add vocab_only
+		`use_mmap`:       f(defaultParams.use_mmap),
+		`use_mlock`:      f(defaultParams.use_mlock),
+		`embedding_only`: f(defaultParams.embedding), // Not f(defaultParams.embedding_only), ?
+
+		`num_keep`:          {`-1`},   // TODO(swdunlop): move to generation options
+		`repeat_last_n`:     {`64`},   // TODO(swdunlop): move to generation options
+		`repeat_penalty`:    {`1.1`},  // TODO(swdunlop): move to generation options
+		`frequency_penalty`: {`0.0`},  // TODO(swdunlop): move to generation options
+		`presence_penalty`:  {`0.0`},  // TODO(swdunlop): move to generation options
+		`temperature`:       {`0.8`},  // TODO(swdunlop): move to generation options
+		`top_k`:             {`40`},   // TODO(swdunlop): move to generation options
+		`top_p`:             {`0.9`},  // TODO(swdunlop): move to generation options
+		`tfs_z`:             {`1.0`},  // TODO(swdunlop): move to generation options
+		`typical_p`:         {`1.0`},  // TODO(swdunlop): move to generation options
+		`mirostat`:          {`0`},    // TODO(swdunlop): move to generation options
+		`mirostat_tau`:      {`5.0`},  // TODO(swdunlop): move to generation options
+		`mirostat_eta`:      {`0.1`},  // TODO(swdunlop): move to generation options
+		`penalize_newline`:  {`true`}, // TODO(swdunlop): move to generation options
+	}
+}
+
+// New creates a new llm.Predictor from a configuration.
+func New(cf configuration.Interface) (llm.Predictor, error) {
+	err := Init(cf)
+	if err != nil {
+		return nil, err
+	}
+	llm := new(llama)
+
+	cf = configuration.Overlay{cf, RuntimeDefault()}
+	err = configuration.Unmarshal(&llm.Options, cf)
+	if err != nil {
 		return nil, err
 	}
 
-	llm := llama{Options: *opts}
+	// TODO(swdunlop): split prediction and model options apart.
+	if _, err := os.Stat(llm.Options.Model); err != nil {
+		return nil, err
+	}
 
+	f, err := os.Open(llm.Options.Model)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close() // TODO(swdunlop): we really don't need the file open the whole time we load this.
+
+	//TODO(swdunlop): do we need decodeGGML at all? shouldn't we just use the llama.cpp API for this?
+	//TODO(swdunlop): if we do, we should move this to a separate package and add gguf as well.
+	//TODO(swdunlop): if we don't, how do we load older GGML models? do we have to offer a converter?
+	ggml, err := decodeGGML(f, modelFamilyLlama)
+	if err != nil {
+		return nil, err
+	}
+
+	switch ggml.FileType().String() {
+	case "F32", "F16", "Q5_0", "Q5_1", "Q8_0":
+		if llm.Options.NumGPU != 0 {
+			// F32, F16, Q5_0, Q5_1, and Q8_0 do not support Metal API and will cause the runner to segmentation fault
+			return nil, fmt.Errorf("GPU acceleration not available for GGML model types F32, F16, Q5_0, Q5_1, and Q8_0")
+		}
+	}
+
+	totalResidentMemory := memory.TotalMemory()
+	switch ggml.ModelType() {
+	case modelType3B, modelType7B:
+		if totalResidentMemory < 8*1024*1024 {
+			return nil, fmt.Errorf("model requires at least 8GB of memory")
+		}
+	case modelType13B:
+		if totalResidentMemory < 16*1024*1024 {
+			return nil, fmt.Errorf("model requires at least 16GB of memory")
+		}
+	case modelType30B:
+		if totalResidentMemory < 32*1024*1024 {
+			return nil, fmt.Errorf("model requires at least 32GB of memory")
+		}
+	case modelType65B:
+		if totalResidentMemory < 64*1024*1024 {
+			return nil, fmt.Errorf("model requires at least 64GB of memory")
+		}
+	}
+
+	switch ggml.ModelFamily() {
+	case modelFamilyLlama:
+	default:
+		return nil, fmt.Errorf("unknown ggml type: %s", ggml.ModelFamily())
+	}
+
+	// TODO(swdunlop): this needs to be done once based on OS environment.  We can't flip this on each model.
 	C.llama_backend_init(C.bool(llm.UseNUMA))
 
 	params := C.llama_context_default_params()
@@ -339,14 +452,13 @@ func newLlama(model string, adapters []string, opts *Options) (*llama, error) {
 	params.rope_freq_base = C.float(llm.RopeFrequencyBase)
 	params.rope_freq_scale = C.float(llm.RopeFrequencyScale)
 
-	if len(adapters) > 0 && llm.UseMMap {
-		log.Printf("must disable mmap to use lora adapters")
-		params.use_mmap = C.bool(false)
+	if len(llm.Options.Adapters) > 0 && llm.UseMMap {
+		return nil, fmt.Errorf(`you cannot combine mmap with lora adapters`)
 	}
 
 	llm.params = &params
 
-	cModel := C.CString(model)
+	cModel := C.CString(llm.Options.Model)
 	defer C.free(unsafe.Pointer(cModel))
 
 	llm.model = C.llama_load_model_from_file(cModel, params)
@@ -359,7 +471,7 @@ func newLlama(model string, adapters []string, opts *Options) (*llama, error) {
 		return nil, errors.New("failed to create context")
 	}
 
-	for _, adapter := range adapters {
+	for _, adapter := range llm.Options.Adapters {
 		cAdapter := C.CString(adapter)
 		defer C.free(unsafe.Pointer(cAdapter))
 
@@ -370,13 +482,25 @@ func newLlama(model string, adapters []string, opts *Options) (*llama, error) {
 
 	// warm up the model
 	bos := []C.llama_token{C.llama_token_bos()}
-	C.llama_eval(llm.tokens, unsafe.SliceData(bos), C.int(len(bos)), 0, C.int(opts.NumThread))
+	C.llama_eval(llm.tokens, unsafe.SliceData(bos), C.int(len(bos)), 0, C.int(llm.Options.NumThread))
 	C.llama_reset_timings(llm.tokens)
 
-	return &llm, nil
+	return llm, nil
 }
 
-func (llm *llama) Close() {
+// Interface describes the full interface produced by New.
+type Interface interface {
+	llm.Predictor
+
+	PredictLlama(context.Context, []int, func(*Prediction) error) error
+	Embedding(string) ([]float64, error)
+	Encode(string) []int
+	Decode(...int) string
+	SetOptions(Options) // TODO(swdunlop): move Options to a map[string]any
+	Release()
+}
+
+func (llm *llama) Release() {
 	llm.gc = true
 
 	llm.mu.Lock()
@@ -389,23 +513,34 @@ func (llm *llama) Close() {
 }
 
 func (llm *llama) SetOptions(opts Options) {
+	// TODO(swdunlop): remove / deprecate, we should have a With method that provides a Predictor with prediction
+	// options.
 	llm.Options = opts
-	// TODO(swdunlop): change to accept map[string]any
 }
 
 var errNeedMoreData = errors.New("need more data")
 
-func (llm *llama) Predict(ctx context.Context, tokens []int, fn func(*Prediction)) error {
-	C.llama_reset_timings(llm.tokens)
+func (m *llama) Predict(ctx context.Context, content string, fn func(llm.Prediction) error) (string, error) {
+	var buf strings.Builder
+	err := m.PredictLlama(ctx, m.Encode(content), func(p *Prediction) error {
+		buf.WriteString(p.Response)
+		err := fn(p)
+		return err
+	})
+	return buf.String(), err
+}
 
-	llm.marshalPrompt(tokens)
+func (m *llama) PredictLlama(ctx context.Context, tokens []int, fn func(*Prediction) error) error {
+	C.llama_reset_timings(m.tokens)
 
-	C.llama_set_rng_seed(llm.tokens, C.uint(llm.Seed))
+	m.marshalPrompt(tokens)
+
+	C.llama_set_rng_seed(m.tokens, C.uint(m.Seed))
 
 	var b bytes.Buffer
 	for {
-		token, err := llm.next(ctx)
-		if llm.gc {
+		token, err := m.next(ctx)
+		if m.gc {
 			return nil
 		} else if errors.Is(err, io.EOF) {
 			break
@@ -413,9 +548,9 @@ func (llm *llama) Predict(ctx context.Context, tokens []int, fn func(*Prediction
 			return err
 		}
 
-		b.WriteString(llm.Decode(int(token)))
+		b.WriteString(m.Decode(int(token)))
 
-		if err := llm.checkStopConditions(b); err != nil {
+		if err := m.checkStopConditions(b); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			} else if errors.Is(err, errNeedMoreData) {
@@ -426,18 +561,21 @@ func (llm *llama) Predict(ctx context.Context, tokens []int, fn func(*Prediction
 		}
 
 		if utf8.Valid(b.Bytes()) || b.Len() >= utf8.UTFMax {
-			fn(&Prediction{Response: b.String()})
+			err := fn(&Prediction{Response: b.String()})
+			if err != nil {
+				return err
+			}
 			b.Reset()
 		}
 	}
 
-	embd := make([]int, len(llm.embd))
-	for i := range llm.embd {
-		embd[i] = int(llm.embd[i])
+	embd := make([]int, len(m.embd))
+	for i := range m.embd {
+		embd[i] = int(m.embd[i])
 	}
 
-	timings := C.llama_get_timings(llm.tokens)
-	fn(&Prediction{
+	timings := C.llama_get_timings(m.tokens)
+	return fn(&Prediction{
 		Done:               true,
 		Context:            embd,
 		SampleCount:        int(timings.n_sample),
@@ -447,8 +585,6 @@ func (llm *llama) Predict(ctx context.Context, tokens []int, fn func(*Prediction
 		EvalCount:          int(timings.n_eval),
 		EvalDuration:       parseDurationMs(float64(timings.t_eval_ms)),
 	})
-
-	return nil
 }
 
 func (llm *llama) checkStopConditions(b bytes.Buffer) error {
@@ -660,4 +796,62 @@ func (llm *llama) Embedding(input string) ([]float64, error) {
 		embeddings[i] = float64(v)
 	}
 	return embeddings, nil
+}
+
+type Prediction struct {
+	Model     string    `json:"model"`
+	CreatedAt time.Time `json:"created_at"`
+	Response  string    `json:"response,omitempty"`
+
+	Done    bool  `json:"done"`
+	Context []int `json:"context,omitempty"`
+
+	TotalDuration      time.Duration `json:"total_duration,omitempty"`
+	LoadDuration       time.Duration `json:"load_duration,omitempty"`
+	SampleCount        int           `json:"sample_count,omitempty"`
+	SampleDuration     time.Duration `json:"sample_duration,omitempty"`
+	PromptEvalCount    int           `json:"prompt_eval_count,omitempty"`
+	PromptEvalDuration time.Duration `json:"prompt_eval_duration,omitempty"`
+	EvalCount          int           `json:"eval_count,omitempty"`
+	EvalDuration       time.Duration `json:"eval_duration,omitempty"`
+}
+
+func (r *Prediction) String() string { return r.Response }
+func (r *Prediction) Tokens() []int  { return r.Context }
+
+func (r *Prediction) Summary() {
+	if r.TotalDuration > 0 {
+		fmt.Fprintf(os.Stderr, "total duration:       %v\n", r.TotalDuration)
+	}
+
+	if r.LoadDuration > 0 {
+		fmt.Fprintf(os.Stderr, "load duration:        %v\n", r.LoadDuration)
+	}
+
+	if r.SampleCount > 0 {
+		fmt.Fprintf(os.Stderr, "sample count:         %d token(s)\n", r.SampleCount)
+	}
+
+	if r.SampleDuration > 0 {
+		fmt.Fprintf(os.Stderr, "sample duration:      %s\n", r.SampleDuration)
+		fmt.Fprintf(os.Stderr, "sample rate:          %.2f tokens/s\n", float64(r.SampleCount)/r.SampleDuration.Seconds())
+	}
+
+	if r.PromptEvalCount > 0 {
+		fmt.Fprintf(os.Stderr, "prompt eval count:    %d token(s)\n", r.PromptEvalCount)
+	}
+
+	if r.PromptEvalDuration > 0 {
+		fmt.Fprintf(os.Stderr, "prompt eval duration: %s\n", r.PromptEvalDuration)
+		fmt.Fprintf(os.Stderr, "prompt eval rate:     %.2f tokens/s\n", float64(r.PromptEvalCount)/r.PromptEvalDuration.Seconds())
+	}
+
+	if r.EvalCount > 0 {
+		fmt.Fprintf(os.Stderr, "eval count:           %d token(s)\n", r.EvalCount)
+	}
+
+	if r.EvalDuration > 0 {
+		fmt.Fprintf(os.Stderr, "eval duration:        %s\n", r.EvalDuration)
+		fmt.Fprintf(os.Stderr, "eval rate:            %.2f tokens/s\n", float64(r.EvalCount)/r.EvalDuration.Seconds())
+	}
 }
