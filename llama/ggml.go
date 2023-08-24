@@ -15,6 +15,7 @@ const (
 	modelType3B  modelType = 26
 	modelType7B  modelType = 32
 	modelType13B modelType = 40
+	modelType34B modelType = 48
 	modelType30B modelType = 60
 	modelType65B modelType = 80
 )
@@ -26,6 +27,8 @@ func (mt modelType) String() string {
 	case modelType7B:
 		return "7B"
 	case modelType13B:
+		return "13B"
+	case modelType34B:
 		return "13B"
 	case modelType30B:
 		return "30B"
