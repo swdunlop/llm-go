@@ -1,5 +1,4 @@
-// Package llm describes the basic types and interfaces shared between large language
-// model implementations.
+// Package llm describes a high level interface to large language models suitable for basic prediction tasks.
 package llm
 
 import (
@@ -49,31 +48,23 @@ type errUnknownImplementation struct{}
 // Error implements the error interface by returning a static string, "unknown implementation"
 func (errUnknownImplementation) Error() string { return "unknown implementation" }
 
-// Interface describes the common interface that large language models supported by
-// this package provide.
+// Interface describes the common interface that large language models supported by this package provide.
 type Interface interface {
 	Release() // Closes the model and releases any associated resources.
 }
 
-// A Predictor is an Interface expanded with support for predicting a continuation
-// of the provided input text.
+// A Predictor is an Interface expanded with support for predicting a continuation of the provided input text.
 type Predictor interface {
 	Interface
 
-	// Predict calls the provided function with the language model's predicted
-	// continuation of the provided input string.  Prediction will stop if the
-	// function returns an error, and will eventually stop after the provided
+	// Predict calls the provided function with the language model's predicted continuation of the provided input
+	// string.  Prediction will stop if the function returns an error, and will eventually stop after the provided
 	// context is cancelled.
 	Predict(context.Context, string, func(Prediction) error) (string, error)
 }
 
-// A Prediction provides a partial prediction of the input continuation from a
-// Predictor.
+// A Prediction provides a partial prediction of the input continuation from a Predictor.
 type Prediction interface {
-	// Tokens will return the newly predicted tokens, or nil if the language model
-	// does not furnish tokens.
-	Tokens() []int
-
 	// String will return the predicted continuation as a string.
 	String() string
 }

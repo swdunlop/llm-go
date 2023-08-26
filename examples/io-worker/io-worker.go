@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/swdunlop/llm-go"
-	"github.com/swdunlop/llm-go/configuration"
 	"github.com/swdunlop/llm-go/llama"
 )
 
@@ -27,9 +26,9 @@ func runWorker() error {
 	go func() { <-ctx.Done(); os.Stdin.Close() }()
 	enc := json.NewEncoder(os.Stdout)
 	dec := json.NewDecoder(os.Stdin)
-	model, err := llama.New(configuration.Map{
-		"model": {os.Args[1]},
-	})
+	options := llama.ModelDefaults(os.Args[1])
+	_ = json.NewEncoder(os.Stderr).Encode(options)
+	model, err := llama.New(options)
 	if err != nil {
 		return err
 	}

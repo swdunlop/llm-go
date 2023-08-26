@@ -1,12 +1,67 @@
 package configuration
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
+
+// Marshal returns the provided structure as a configuration, with similar restrictions to Unmarshal.
+func Marshal(v any) (Interface, error) {
+	rv := reflect.Indirect(reflect.ValueOf(v))
+	if rv.Kind() != reflect.Struct {
+		return nil, fmt.Errorf(`marshal can only be used with struct pointers, got %T`, v)
+	}
+	rt := rv.Type()
+	nf := rt.NumField()
+	cf := make(Map, nf)
+	for i := 0; i < nf; i++ {
+		ft := rt.Field(i)
+		if ft.PkgPath != `` {
+			continue
+		}
+		name := ft.Name
+		if tag := ft.Tag.Get(`llm`); tag != `` {
+			name = tag
+		} else if tag := ft.Tag.Get(`yaml`); tag != `` {
+			name = tag
+		} else if tag := ft.Tag.Get(`json`); tag != `` {
+			name = tag
+		}
+		if name == `` || name == `-` {
+			continue
+		}
+		fv := rv.Field(i)
+		if !fv.CanInterface() {
+			continue
+		}
+		switch fv.Kind() {
+		case reflect.String:
+			cf[name] = []string{fv.String()}
+		case reflect.Slice:
+			if fv.Type().Elem().Kind() != reflect.String {
+				continue
+			}
+			cf[name] = []string{strings.Join(fv.Interface().([]string), `,`)}
+		case reflect.Bool:
+			cf[name] = []string{strconv.FormatBool(fv.Bool())}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			cf[name] = []string{strconv.FormatInt(fv.Int(), 10)}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			cf[name] = []string{strconv.FormatUint(fv.Uint(), 10)}
+		case reflect.Float32, reflect.Float64:
+			cf[name] = []string{strconv.FormatFloat(fv.Float(), 'f', -1, 64)}
+		default:
+			continue
+		}
+	}
+	return cf, nil
+}
 
 // Unmarshal uses the provided configuration to unmarshal the exported fields of v, which must be a pointer to a struct.
 // The names of the fields are used to look up configuration values, but are overridden by the following struct tags,
@@ -140,14 +195,107 @@ type Map map[string][]string
 func (cf Map) GetConfiguration(name string) []string { return cf[name] }
 
 // UnmarshalJSON satisfies json.Unmarshaler using a map of values, where each value
-// may be a string, a number, true, false, null, or an array of strings.
-func (cf *Map) UnmarshalJSON(p []byte) error { panic(`TODO`) }
+// may be a string, a number, true, false, null, or an array of values that are not arrays.
+func (cf *Map) UnmarshalJSON(p []byte) error {
+	var m map[string]any
+	if err := json.Unmarshal(p, &m); err != nil {
+		return err
+	}
+	*cf = make(Map, len(m))
+	for k, v := range m {
+		switch v := v.(type) {
+		case string:
+			(*cf)[k] = []string{v}
+		case map[string]any:
+			return fmt.Errorf(`nested maps not supported for %q`, k)
+		case []any:
+			(*cf)[k] = make([]string, len(v))
+			for i, v := range v {
+				switch v := v.(type) {
+				case []any:
+				case map[string]any:
+				default:
+					(*cf)[k][i] = fmt.Sprint(v)
+				}
+			}
+		default:
+			(*cf)[k] = []string{fmt.Sprint(v)}
+		}
+	}
+	return nil
+}
 
 // MarshalJSON satisfies json.Marshaler by encoding a map of values, where each
 // value is either a string, true, false, null, or an array of strings.  This is
 // not perfectly symmetric with UnmarshalJSON, which also accepts numbers, which this
 // marshaller will not produce.
-func (cf Map) MarshalJSON() ([]byte, error) { panic(`TODO`) }
+func (cf Map) MarshalJSON() ([]byte, error) {
+	m := make(map[string]any, len(cf))
+	for k, v := range cf {
+		switch len(v) {
+		case 0:
+		case 1:
+			v := v[0]
+			switch v {
+			case `true`:
+				m[k] = true
+			case `false`:
+				m[k] = false
+			case `null`:
+				m[k] = nil
+			default:
+				m[k] = v
+			}
+		default:
+			seq := make([]any, len(v))
+			for i, it := range v {
+				switch it {
+				case `true`:
+					seq[i] = true
+				case `false`:
+					seq[i] = false
+				case `null`:
+					seq[i] = nil
+				default:
+					seq[i] = it
+				}
+			}
+			m[k] = seq
+		}
+	}
+	return json.Marshal(m)
+}
+
+// UnmarshalYAML satisfies yaml.Unmarshaler using a map of values, where each value
+// may be a string, a number, true, false, null, or an array of values that are not arrays.
+func (cf *Map) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf(`expected a map , got %v`, value.Kind)
+	}
+	*cf = make(Map, len(value.Content)/2)
+	for i := 0; i < len(value.Content); i += 2 {
+		name := value.Content[i].Value
+		if name == `` {
+			return fmt.Errorf(`expected a string key, got %v`, value.Content[i].Kind)
+		}
+		value := value.Content[i+1]
+		switch value.Kind {
+		case yaml.ScalarNode:
+			(*cf)[name] = []string{value.Value}
+		case yaml.SequenceNode:
+			(*cf)[name] = make([]string, len(value.Content))
+			for i, v := range value.Content {
+				if v.Kind != yaml.ScalarNode {
+					return fmt.Errorf(`expected a scalar item, got %v`, v.Kind)
+				}
+				(*cf)[name][i] = v.Value
+			}
+		default:
+			return fmt.Errorf(`expected a scalar or sequence, got %v`, value.Kind)
+		}
+	}
+	return nil
+}
 
 // Environment provides a configuration that gets values from the OS environment,
 // adding the provided prefix to each lookup.  This is the most common source of
@@ -179,6 +327,20 @@ func Environment(prefix string) Interface {
 			return []string{value}
 		})
 	}
+}
+
+// With returns a configuration with the named item overloaded with the provided values.
+func With(cf Interface, name string, values ...any) Interface {
+	items := make([]string, len(values))
+	for i, it := range values {
+		items[i] = fmt.Sprint(it)
+	}
+	return configFn(func(n string) []string {
+		if n == name {
+			return items
+		}
+		return cf.GetConfiguration(n)
+	})
 }
 
 type configFn func(name string) []string
