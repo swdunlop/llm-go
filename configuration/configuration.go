@@ -26,7 +26,7 @@ func Marshal(v any) (Interface, error) {
 			continue
 		}
 		name := ft.Name
-		if tag := ft.Tag.Get(`llm`); tag != `` {
+		if tag := ft.Tag.Get(`cfg`); tag != `` {
 			name = tag
 		} else if tag := ft.Tag.Get(`yaml`); tag != `` {
 			name = tag
@@ -65,7 +65,7 @@ func Marshal(v any) (Interface, error) {
 
 // Unmarshal uses the provided configuration to unmarshal the exported fields of v, which must be a pointer to a struct.
 // The names of the fields are used to look up configuration values, but are overridden by the following struct tags,
-// in order of precedence: "llm", "yaml", "json".
+// in order of precedence: "cfg", "yaml", "json".
 //
 // Like with Get, unconfigured fields are left unchanged and the supported field types are string, []string, bool, int
 // and floats.
@@ -86,7 +86,7 @@ func Unmarshal(v interface{}, cf Interface) error {
 			continue
 		}
 		name := ft.Name
-		if tag := ft.Tag.Get(`llm`); tag != `` {
+		if tag := ft.Tag.Get(`cfg`); tag != `` {
 			name = strings.SplitN(tag, `,`, 2)[0]
 		} else if tag := ft.Tag.Get(`yaml`); tag != `` {
 			name = strings.SplitN(tag, `,`, 2)[0]
