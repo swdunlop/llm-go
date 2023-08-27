@@ -23,15 +23,23 @@ Support Language Models Over NATS
 [x] Add an option for client names to the NATS client.
 [x] Ensure that when the worker is cancelled, it signals error 8.
 [x] Ensure that when the client is cancelled, it sends an interrupt.
+[ ] Support specifying the model from a directory of models and loading on demand.
+    This lets the client control which model is used.
+[ ] Support requesting a list of models.
 
 LLaMA Usability Improvements
 [x] Add "instructions" and make "content" an array of strings, not a single string.
     This greatly simplifies telling LLaMA that there is content that cannot be edited down for generation (the
     instructions) and tells it how to edit down the content for generation (the content).
+[x] Add "llm settings" subcommand to list settings visible to the llm command.
+    This can at least help show what could be set in the environment to control the llm command.
+[ ] Add functional predict and model options to improve llama usability.
+    It's still really hard to understand all the options that llama supports, especially with the abstractions in 
+    play.
+[ ] Adjust the generic interface to accept prediction configuration.
 [ ] Document ModelOptions and PrefixOptions understood by llama 
     The configuration model makes it harder to know what options are available.  Adding some markdown documentation to
     the package is needed.
-
 
 Bug Fixes for LLaMA
 [ ] If len(tokens) == 0, llama.Model.next will panic.  (Inherited from ollama)

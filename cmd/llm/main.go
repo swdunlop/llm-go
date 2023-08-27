@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/chzyer/readline"
@@ -14,14 +15,15 @@ import (
 	"github.com/swdunlop/llm-go/nats/worker"
 	"github.com/swdunlop/zugzug-go"
 
-	_ "github.com/swdunlop/llm-go/llama"
-	_ "github.com/swdunlop/llm-go/nats"
+	"github.com/swdunlop/llm-go/llama"
+	"github.com/swdunlop/llm-go/nats"
 )
 
 var tasks = zugzug.Tasks{
 	{Name: "worker", Use: "runs a NATS worker with the specified LLM type and model", Fn: runWorker},
 	{Name: "client", Use: "runs the specified LLM type and model in interactive mode", Fn: runClient},
 	{Name: "predict", Use: "reads stdin and predicts a continuation to stdout", Fn: predictOutput},
+	{Name: "settings", Use: "prints the current settings combining the defaults and configuration", Fn: printSettings},
 }
 
 func init() {
@@ -110,19 +112,58 @@ func newPredictor(ctx context.Context) (llm.Predictor, error) {
 }
 
 func newLLM(ctx context.Context) (llm.Interface, error) {
-	var model string
-	err := configuration.Get(&model, cf, `llm_model`)
+	var driver string
+	err := configuration.Get(&driver, cf, `type`)
 	if err != nil {
 		return nil, err
 	}
-	return llm.New(model, cf)
+	return llm.New(driver, cf)
+}
+
+func printSettings(ctx context.Context) error {
+	cf := configuration.Overlay{
+		cf,
+		asConfiguration(llama.ModelDefaults(defaultModel)),
+		asConfiguration(llama.PredictDefaults()),
+		asConfiguration(nats.ClientDefaults()),
+	}
+	items := cf.Configured()
+	sort.Strings(items)
+	for _, item := range items {
+		values := cf.GetConfiguration(item)
+		switch len(values) {
+		case 0:
+			// do nothing
+		case 1:
+			fmt.Printf("llm_%s=%q\n", item, values[0])
+		default:
+			fmt.Printf("llm_%s:\n", item)
+			for _, v := range values {
+				fmt.Printf("  %q\n", v)
+			}
+		}
+	}
+	return nil
+}
+
+func asConfiguration(v any) configuration.Interface {
+	cf, ok := v.(configuration.Interface)
+	if ok {
+		return cf
+	}
+	var err error
+	cf, err = configuration.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return cf
 }
 
 var cf = configuration.Overlay{
-	configuration.Environment(``),
+	configuration.Environment(`llm_`),
 	configuration.Map{
-		`llm_type`: {defaultType},
-		`model`:    {defaultModel},
+		`type`:  {defaultType},
+		`model`: {defaultModel},
 	},
 }
 

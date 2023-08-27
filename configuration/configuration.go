@@ -33,6 +33,7 @@ func Marshal(v any) (Interface, error) {
 		} else if tag := ft.Tag.Get(`json`); tag != `` {
 			name = tag
 		}
+		name = strings.SplitN(name, `,`, 2)[0]
 		if name == `` || name == `-` {
 			continue
 		}
@@ -169,12 +170,33 @@ func (cf Overlay) GetConfiguration(name string) []string {
 		if it == nil {
 			continue
 		}
-		ret := it.GetConfiguration(name)
-		if ret != nil {
-			return ret
+		items := it.GetConfiguration(name)
+		if items != nil {
+			return items
 		}
 	}
 	return nil
+}
+
+// Configured returns the list of items that have been configured in the provided interfaces.
+func (cf Overlay) Configured() []string {
+	return Configured(cf...)
+}
+
+// Configured returns the list of items that have been configured in the provided interfaces, in their presence
+// order but with duplicates removed.
+func Configured(configurations ...Interface) []string {
+	seen := make(map[string]struct{}, 256)
+	items := make([]string, 0, 256)
+	for _, cf := range configurations {
+		for _, item := range cf.Configured() {
+			if _, ok := seen[item]; !ok {
+				seen[item] = struct{}{}
+				items = append(items, item)
+			}
+		}
+	}
+	return items
 }
 
 // Interface describes a generic interface for providing a configuration for
@@ -184,6 +206,20 @@ type Interface interface {
 	// returns either nil or a slice with a single string value.  Nil indicates
 	// that there was no configuration, and therefore a default can be used.
 	GetConfiguration(name string) []string
+
+	// Configured returns the list of items that have been configured.  This list does not need to be unique
+	// or sorted.
+	Configured() []string
+}
+
+// MapOf maps the configured items.
+func MapOf(cf Interface) Map {
+	items := cf.Configured()
+	m := make(Map, len(items))
+	for _, item := range items {
+		m[item] = cf.GetConfiguration(item)
+	}
+	return m
 }
 
 // Map uses a map of strings to provide a configuration.  This is
@@ -193,6 +229,15 @@ type Map map[string][]string
 
 // GetConfiguration returns the value for the given name, or nil if there is no value.
 func (cf Map) GetConfiguration(name string) []string { return cf[name] }
+
+// Configured returns the list of items that have been configured in the map.
+func (cfg Map) Configured() []string {
+	items := make([]string, 0, len(cfg))
+	for item := range cfg {
+		items = append(items, item)
+	}
+	return items
+}
 
 // UnmarshalJSON satisfies json.Unmarshaler using a map of values, where each value
 // may be a string, a number, true, false, null, or an array of values that are not arrays.
@@ -302,31 +347,37 @@ func (cf *Map) UnmarshalYAML(value *yaml.Node) error {
 // configuration.  If the prefix is uppercase, then names will be converted to
 // uppercase before lookup.
 func Environment(prefix string) Interface {
-	if prefix == `` {
-		return configFn(func(name string) []string {
-			value, ok := os.LookupEnv(name)
-			if !ok {
-				return nil
-			}
-			return []string{value}
-		})
-	} else if strings.ToUpper(prefix) == prefix {
-		return configFn(func(name string) []string {
-			value, ok := os.LookupEnv(prefix + strings.ToUpper(name))
-			if !ok {
-				return nil
-			}
-			return []string{value}
-		})
-	} else {
-		return configFn(func(name string) []string {
-			value, ok := os.LookupEnv(prefix + name)
-			if !ok {
-				return nil
-			}
-			return []string{value}
-		})
+	return environment{
+		prefix != `` && strings.ToUpper(prefix) == prefix,
+		prefix,
 	}
+}
+
+type environment struct {
+	uppercase bool
+	prefix    string
+}
+
+func (cf environment) Configured() []string {
+	for _, it := range os.Environ() {
+		if strings.HasPrefix(it, cf.prefix) {
+			return []string{it[len(cf.prefix):]}
+		}
+	}
+	return nil
+}
+
+func (cf environment) GetConfiguration(name string) []string {
+	if cf.uppercase {
+		name = cf.prefix + strings.ToUpper(name)
+	} else {
+		name = cf.prefix + name
+	}
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return nil
+	}
+	return []string{value}
 }
 
 // With returns a configuration with the named item overloaded with the provided values.
@@ -335,14 +386,22 @@ func With(cf Interface, name string, values ...any) Interface {
 	for i, it := range values {
 		items[i] = fmt.Sprint(it)
 	}
-	return configFn(func(n string) []string {
-		if n == name {
-			return items
-		}
-		return cf.GetConfiguration(n)
-	})
+	return with{name, items, cf}
 }
 
-type configFn func(name string) []string
+type with struct {
+	name   string
+	values []string
+	cf     Interface
+}
 
-func (fn configFn) GetConfiguration(name string) []string { return fn(name) }
+func (cf with) GetConfiguration(name string) []string {
+	if name == cf.name {
+		return cf.values
+	}
+	return cf.cf.GetConfiguration(name)
+}
+
+func (cf with) Configured() []string {
+	return append([]string{cf.name}, cf.Configured()...)
+}

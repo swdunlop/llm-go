@@ -28,11 +28,7 @@ func init() {
 // request, otherwise llm.worker.default will be used.
 func NewNATS(conn *nats.Conn, cf configuration.Interface) (*Client, error) {
 	ct := new(Client)
-	ct.options = ClientOptions{
-		URL:           nats.DefaultURL,
-		WorkerSubject: "llm.worker.default",
-		ClientName:    "llm-client",
-	}
+	ct.options = *ClientDefaults()
 	err := configuration.Unmarshal(&ct.options, cf)
 	if err != nil {
 		return nil, err
@@ -241,6 +237,14 @@ func (ct *Client) Release() {
 		ct.release()
 	}
 	ct.conn = nil
+}
+
+func ClientDefaults() *ClientOptions {
+	return &ClientOptions{
+		URL:           `nats://localhost:4222`,
+		WorkerSubject: `llm.worker.default`,
+		ClientName:    `llm-client`,
+	}
 }
 
 // ClientOptions describes the options used to create a NATS client.  This is unmarshalled from the configuration
