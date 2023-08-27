@@ -37,36 +37,6 @@ func Run(ctx context.Context, cf configuration.Interface, options ...Option) err
 		}
 	}
 
-	if w.conn == nil {
-		var err error
-		w.conn, err = nats.Connect(w.options.NATSUrl, nats.Name(w.options.ClientName))
-		if err != nil {
-			return err
-		}
-		defer w.conn.Close()
-	}
-
-	ch := make(chan *nats.Msg)
-	slog.From(ctx).Debug(`subscribing to worker subject`, `subject`, w.options.WorkerSubject)
-	sub, err := w.conn.ChanQueueSubscribe(w.options.WorkerSubject, "llm-worker", ch)
-	if err != nil {
-		return err
-	}
-
-	unsubscribed := make(chan struct{})
-	defer func() { <-unsubscribed }()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		defer close(unsubscribed)
-		<-ctx.Done()
-		err := sub.Unsubscribe()
-		if err != nil {
-			slog.Warn(`failed to unsubscribe from worker subject`, `subject`, w.options.WorkerSubject, `err`, err.Error())
-		}
-		close(ch)
-	}()
-
 	if w.model == nil {
 		if w.options.LLMType == "" {
 			return errors.New(`llm type must be specified`)
@@ -83,6 +53,34 @@ func Run(ctx context.Context, cf configuration.Interface, options ...Option) err
 		defer w.model.Release()
 	}
 
+	if w.conn == nil {
+		var err error
+		w.conn, err = nats.Connect(w.options.NATSUrl, nats.Name(w.options.ClientName))
+		if err != nil {
+			return err
+		}
+		defer w.conn.Close()
+	}
+
+	ch := make(chan *nats.Msg)
+	slog.From(ctx).Debug(`subscribing to worker subject`, `subject`, w.options.WorkerSubject)
+	sub, err := w.conn.ChanQueueSubscribe(w.options.WorkerSubject, "llm-worker", ch)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		defer close(ch)
+		<-ctx.Done()
+		err := sub.Unsubscribe()
+		if err != nil {
+			slog.Warn(`failed to unsubscribe from worker subject`, `subject`, w.options.WorkerSubject, `err`, err.Error())
+		}
+	}()
+
+	w.job.done = make(chan struct{})
 	w.job.ch = make(chan predictRequest, 4)
 	go w.processPredictRequests()
 	w.run(ctx, ch)
@@ -112,9 +110,8 @@ type worker struct {
 	conn    *nats.Conn
 	model   llm.Predictor
 	job     struct {
-		ch   chan predictRequest
-		done chan struct{}
-
+		done    chan struct{}
+		ch      chan predictRequest
 		control sync.RWMutex
 		id      string
 		cancel  func() // cancels a prediction
@@ -123,10 +120,8 @@ type worker struct {
 }
 
 func (w *worker) run(ctx context.Context, ch chan *nats.Msg) {
-	defer func() {
-		close(w.job.ch)
-		<-w.job.done
-	}()
+	defer func() { <-w.job.done }()
+	defer close(w.job.ch)
 	for msg := range ch {
 		w.process(ctx, msg)
 	}
@@ -165,14 +160,15 @@ func (w *worker) process(ctx context.Context, nm *nats.Msg) {
 func (w *worker) predict(ctx context.Context, reply, job string, req *msg.PredictRequest) {
 	ok := make(chan struct{}) // closed when the job.id and job.cancel are set and it is safe to process the next request.
 	select {
-	case <-ctx.Done():
-		w.reject(ctx, reply, msg.ErrShuttingDown, `worker shutting down`)
 	case w.job.ch <- predictRequest{ok, reply, job, req}:
 		select {
 		case <-ok:
 		case <-ctx.Done():
 		}
-		// do nothing, the model will handle response.
+	case <-ctx.Done():
+		w.reject(ctx, reply, msg.ErrShuttingDown, `worker shutting down`) // should never happen.
+	case <-w.job.done:
+		w.reject(ctx, reply, msg.ErrShuttingDown, `worker shut down`) // should never happen.
 	default:
 		w.reject(ctx, reply, msg.ErrBusy, `worker busy`)
 	}
@@ -190,6 +186,7 @@ func (w *worker) interrupt(ctx context.Context, reply, job string) {
 }
 
 func (w *worker) processPredictRequests() {
+	defer close(w.job.done)
 	for req := range w.job.ch {
 		slog.Debug(`processing predict request`, `job`, req.job, `reply`, req.reply)
 		w.processPredictRequest(req)
@@ -227,7 +224,6 @@ func (w *worker) processPredictRequest(req predictRequest) {
 			if output == `` {
 				return nil // weird hiccup, we should run this down.
 			}
-			// TODO: capture errors and send them back through the driver.
 			return w.respond(ctx, req.Stream, &msg.WorkerResponse{
 				Job:    req.job,
 				Stream: &msg.StreamResponse{Output: output},
