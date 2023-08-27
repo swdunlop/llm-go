@@ -60,7 +60,7 @@ type Predictor interface {
 	// Predict calls the provided function with the language model's predicted continuation of the provided input
 	// string.  Prediction will stop if the function returns an error, and will eventually stop after the provided
 	// context is cancelled.
-	Predict(context.Context, string, func(Prediction) error) (string, error)
+	Predict(context.Context, []string, func(Prediction) error) (string, error)
 }
 
 // A Prediction provides a partial prediction of the input continuation from a Predictor.

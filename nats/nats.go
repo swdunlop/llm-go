@@ -94,7 +94,7 @@ func (ct *Client) handleNatsError(conn *nats.Conn, sub *nats.Subscription, err e
 }
 
 // Predict implements the llm.Predictor interface by sending a request to the worker and waiting for a response.
-func (ct *Client) Predict(ctx context.Context, input string, fn func(llm.Prediction) error) (output string, err error) {
+func (ct *Client) Predict(ctx context.Context, input []string, fn func(llm.Prediction) error) (output string, err error) {
 	job := ct.nuid.Next()
 	stream := ""
 	if fn != nil {

@@ -31,7 +31,7 @@ type PredictRequest struct {
 
 	// Input contains the portion of the input that should be used to predict tokens.  Input may be truncated, losing
 	// lines of text from the beginning of the input to fit within the token context limits.
-	Input string `json:"input,omitempty"`
+	Input []string `json:"input,omitempty"`
 
 	// Stream identifies a NATS subject where incremental results should be sent as they are produced.  This subject will
 	// receive a stream of PredictStream messages in JSON format.

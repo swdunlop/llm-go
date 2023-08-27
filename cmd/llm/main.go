@@ -78,7 +78,7 @@ func runClient(ctx context.Context) error {
 
 func outputPrediction(ctx context.Context, w io.Writer, m llm.Predictor, input string) error {
 	predicted := 0
-	output, err := m.Predict(ctx, input, func(prediction llm.Prediction) error {
+	output, err := m.Predict(ctx, strings.Split(input, "\n"), func(prediction llm.Prediction) error {
 		output := prediction.String()
 		predicted += len(output)
 		_, err := w.Write([]byte(output))

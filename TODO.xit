@@ -24,6 +24,15 @@ Support Language Models Over NATS
 [x] Ensure that when the worker is cancelled, it signals error 8.
 [x] Ensure that when the client is cancelled, it sends an interrupt.
 
+LLaMA Usability Improvements
+[x] Add "instructions" and make "content" an array of strings, not a single string.
+    This greatly simplifies telling LLaMA that there is content that cannot be edited down for generation (the
+    instructions) and tells it how to edit down the content for generation (the content).
+[ ] Document ModelOptions and PrefixOptions understood by llama 
+    The configuration model makes it harder to know what options are available.  Adding some markdown documentation to
+    the package is needed.
+
+
 Bug Fixes for LLaMA
 [ ] If len(tokens) == 0, llama.Model.next will panic.  (Inherited from ollama)
 [ ] Why does llama.Model.Predict call the callback once with an empty output at the end of generation?
