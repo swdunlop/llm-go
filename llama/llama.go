@@ -93,7 +93,6 @@ import (
 	"bytes"
 	"context"
 	"embed"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -108,6 +107,7 @@ import (
 	"github.com/pbnjay/memory"
 	"github.com/swdunlop/llm-go"
 	"github.com/swdunlop/llm-go/configuration"
+	"github.com/swdunlop/llm-go/internal/slog"
 )
 
 // Init configure things in llama.cpp that are not specific to the llama interface, specifically `LLAMA_USE_NUMA`.  If
@@ -588,7 +588,8 @@ func (m *Model) PredictLlama(ctx context.Context, options *PredictOptions, token
 	C.llama_reset_timings(m.tokens)
 	m.marshalPrompt(options, tokens)
 	C.llama_set_rng_seed(m.tokens, C.uint(options.Seed))
-	json.NewEncoder(os.Stderr).Encode(options) // TODO
+
+	slog.From(ctx).Debug(`predicting`, `options`, options, `tokenCt`, len(tokens))
 
 	var p Prediction
 	p.model = m

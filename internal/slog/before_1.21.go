@@ -20,6 +20,9 @@ func setDefault(l *logger)             { slog.SetDefault(l) }
 func newTextHandler(w io.Writer, opts *handlerOptions) slog.Handler {
 	return slog.NewTextHandler(w, opts)
 }
+func newJSONHandler(w io.Writer, opts *handlerOptions) slog.Handler {
+	return slog.NewJSONHandler(w, opts)
+}
 
 const (
 	levelDebug = slog.LevelDebug
