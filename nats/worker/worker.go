@@ -82,7 +82,7 @@ func Run(ctx context.Context, cf configuration.Interface, options ...Option) err
 
 	w.job.done = make(chan struct{})
 	w.job.ch = make(chan predictRequest, 4)
-	go w.processPredictRequests()
+	go w.processPredictRequests(ctx)
 	w.run(ctx, ch)
 	return nil
 }
@@ -133,9 +133,9 @@ func (w *worker) process(ctx context.Context, nm *nats.Msg) {
 	err := json.Unmarshal(nm.Data, &req)
 	switch {
 	case err != nil:
-		w.reject(ctx, nm.Reply, msg.ErrIllegibleRequest, err.Error())
+		w.reject(ctx, nm.Reply, ``, msg.ErrIllegibleRequest, err.Error())
 	case req.Job == "":
-		w.reject(ctx, nm.Reply, msg.ErrInvalidRequest, "job id is required")
+		w.reject(ctx, nm.Reply, ``, msg.ErrInvalidRequest, "job id is required")
 		return
 	}
 
@@ -152,7 +152,7 @@ func (w *worker) process(ctx context.Context, nm *nats.Msg) {
 	}
 
 	if !ok {
-		w.reject(ctx, nm.Reply, msg.ErrUnsupportedCommand, "command not supported")
+		w.reject(ctx, nm.Reply, req.Job, msg.ErrUnsupportedCommand, "command not supported")
 	}
 }
 
@@ -166,11 +166,11 @@ func (w *worker) predict(ctx context.Context, reply, job string, req *msg.Predic
 		case <-ctx.Done():
 		}
 	case <-ctx.Done():
-		w.reject(ctx, reply, msg.ErrShuttingDown, `worker shutting down`) // should never happen.
+		w.reject(ctx, reply, job, msg.ErrShuttingDown, `worker shutting down`) // should never happen.
 	case <-w.job.done:
-		w.reject(ctx, reply, msg.ErrShuttingDown, `worker shut down`) // should never happen.
+		w.reject(ctx, reply, job, msg.ErrShuttingDown, `worker shut down`) // should never happen.
 	default:
-		w.reject(ctx, reply, msg.ErrBusy, `worker busy`)
+		w.reject(ctx, reply, job, msg.ErrBusy, `worker busy`)
 	}
 }
 
@@ -185,19 +185,19 @@ func (w *worker) interrupt(ctx context.Context, reply, job string) {
 	_ = w.respond(ctx, reply, &msg.WorkerResponse{Interrupt: &msg.InterruptResponse{}})
 }
 
-func (w *worker) processPredictRequests() {
+func (w *worker) processPredictRequests(ctx context.Context) {
 	defer close(w.job.done)
 	for req := range w.job.ch {
 		slog.Debug(`processing predict request`, `job`, req.job, `reply`, req.reply)
-		w.processPredictRequest(req)
+		w.processPredictRequest(ctx, req)
 		slog.Debug(`finished processing predict request`, `job`, req.job, `reply`, req.reply)
 	}
 }
 
-func (w *worker) processPredictRequest(req predictRequest) {
+func (w *worker) processPredictRequest(ctx context.Context, req predictRequest) {
 	w.job.control.Lock()
 	w.job.id = req.job
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx) // TODO: this should be a child of the context passed to run
 	w.job.cancel = cancel
 	w.job.control.Unlock()
 	close(req.ok)
@@ -208,18 +208,23 @@ func (w *worker) processPredictRequest(req predictRequest) {
 		case nil:
 			// do nothing
 		case msg.Error:
-			w.reject(ctx, req.reply, err.Code, err.Err)
+			w.reject(ctx, req.reply, req.job, err.Code, err.Err)
 			return
 		default:
-			w.reject(ctx, req.reply, msg.ErrHookFailed, err.Error())
+			w.reject(ctx, req.reply, req.job, msg.ErrHookFailed, err.Error())
 			return
 		}
 	}
 
-	callback := func(llm.Prediction) error { return nil }
+	callback := func(llm.Prediction) error {
+		return ctx.Err() // keep checking for context cancellation.
+	}
 	reply := req.reply
 	if req.Stream != `` {
 		callback = func(p llm.Prediction) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			output := p.String()
 			if output == `` {
 				return nil // weird hiccup, we should run this down.
@@ -245,9 +250,9 @@ func (w *worker) processPredictRequest(req predictRequest) {
 			Predict: &msg.PredictResponse{Output: output},
 		})
 	case errors.Is(err, context.Canceled):
-		w.reject(ctx, reply, msg.ErrInterrupted, `prediction interrupted`)
+		w.reject(ctx, reply, req.job, msg.ErrInterrupted, `prediction interrupted`)
 	default:
-		w.reject(ctx, reply, msg.ErrPredictionFailed, err.Error())
+		w.reject(ctx, reply, req.job, msg.ErrPredictionFailed, err.Error())
 	}
 }
 
@@ -258,8 +263,9 @@ type predictRequest struct {
 	*msg.PredictRequest
 }
 
-func (w *worker) reject(ctx context.Context, reply string, code int, message string) {
+func (w *worker) reject(ctx context.Context, reply string, job string, code int, message string) {
 	_ = w.respond(ctx, reply, &msg.WorkerResponse{
+		Job: job,
 		Error: &msg.Error{
 			Code: code,
 			Err:  message,

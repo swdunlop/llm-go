@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
@@ -133,6 +134,7 @@ func (ct *Client) Predict(ctx context.Context, input string, fn func(llm.Predict
 	for {
 		select {
 		case <-ctx.Done():
+			ct.interrupt(job)
 			return "", ctx.Err()
 		case msg := <-streamCh:
 			ok := false
@@ -208,25 +210,17 @@ func (ct *Client) processStreamData(data []byte) {
 	}
 }
 
-// func (sn *session) interrupt(perr *error, ct *Client) {
-// 	var err error
-// 	req := msg.WorkerRequest{Job: sn.job, Interrupt: &msg.InterruptRequest{}}
-// 	msg := nats.NewMsg(ct.options.WorkerSubject)
-// 	msg.Header.Add("job", sn.job)
-// 	msg.Header.Add("interrupt", "true")
-// 	msg.Data, err = json.Marshal(&req)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	err = ct.conn.PublishMsg(msg)
-// 	switch {
-// 	case err == nil:
-// 	case *perr != nil:
-// 		slog.Warn(`failed to interrupt job`, `job`, sn.job, `error`, err)
-// 	default:
-// 		*perr = err
-// 	}
-// }
+func (ct *Client) interrupt(job string) {
+	req := msg.WorkerRequest{Job: job, Interrupt: &msg.InterruptRequest{}}
+	data, err := json.Marshal(&req)
+	if err != nil {
+		panic(err)
+	}
+	_, err = ct.conn.Request(ct.options.WorkerSubject, data, time.Second)
+	if err != nil {
+		slog.Warn(`failed to interrupt job`, `job`, job, `error`, err)
+	}
+}
 
 // Release implements llm.Interface by unsubscribing from NATS.  Release will close the NATS connection if NewNATS
 // opened it.  (This happens when NewNATS is called with a nil connection, or llm.New(`nats`) is used.)

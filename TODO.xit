@@ -21,7 +21,8 @@ Support Language Models Over NATS
     released on 2023-08-08.  (What the heck took so long for this to reach stable?)
 [x] Add a NATS worker implentation compatible with the NATS client usable with LLM interface implementations.
 [x] Add an option for client names to the NATS client.
-[x] BUG: When the worker receives SIGINT, it does should either complete its generation or signal an error.
+[x] Ensure that when the worker is cancelled, it signals error 8.
+[x] Ensure that when the client is cancelled, it sends an interrupt.
 
 Bug Fixes for LLaMA
 [ ] If len(tokens) == 0, llama.Model.next will panic.  (Inherited from ollama)
