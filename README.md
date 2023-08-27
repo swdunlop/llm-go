@@ -66,3 +66,23 @@ build, your binary will be linked against the Nix store, which means it will not
 Like the original [ollama](https://ollama.ai) wrapper, `llm-go` currently uses a script to pull in the C++ code and 
 headers from a [llama.cpp](https://github.com/ggerganov/llama.cpp) checkout.  This script also prepends Go build tags 
 to control which features are built.  (For example, if you don't have Metal acceleration, you can build without it.)
+
+## Using NATS Workers
+
+The `llm worker` command will subscribe to a [NATS](https://nats.io) subject and process prediction requests using the
+model specified in the `llm worker` environment.  This can be combined with the `llm client` / `llm predict` command,
+or the [./nats](./nats) package to request predictions over a NATS network.
+
+This is particularly useful for running multiple instances of a model on other hosts.
+
+### Example Usage:
+
+The following three BASH commands will start a [NATS](https://nats.io) server, a `llm worker` that will will generate
+predictions to requests to `llm.worker.default` and connect to it with `llm predict` to generate a prediction.
+
+```bash
+gnatsd &
+llm_model=vicuna-7b-v1.5.ggmlv3.q5_K_M.bin llm worker &
+echo "What is the airspeed of an unladen swallow?" | llm_type=nats go run ./cmd/llm predict
+```
+
