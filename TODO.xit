@@ -13,22 +13,36 @@ Refactor Llama and LLM
 [x] Split llama.Options into llama.ModelOptions and llama.PredictOptions
 [x] Document all the exported types and functions.
 
+Support Language Models Over NATS
+[x] Add a NATS client implementation of the llm.Interface that lets a frontend call a backend.
+    This would be a good example of how to use llama models in a distributed system, balancing the work across
+    multiple backends.
+[x] Ensure the NATS worker uses log/slog for logging -- this requires Go 1.21, which is unfortunate since it was only
+    released on 2023-08-08.  (What the heck took so long for this to reach stable?)
+[x] Add a NATS worker implentation compatible with the NATS client usable with LLM interface implementations.
+[x] Add an option for client names to the NATS client.
+
+Bug Fixes for LLaMA
+[ ] If len(tokens) == 0, llama.Model.next will panic.  (Inherited from ollama)
+[ ] Why does llama.Model.Predict call the callback once with an empty output at the end of generation?
+
+Support Language Models Over HTTP
+[ ] Implement "llm server", an HTTP service that can serve pluggable LLM models.
+[ ] Implement "llama-server" mimic API in "llm server"
+[ ] Implement "Kobold AI" mimic API in "llm server"
+[ ] Implement "OpenAI" mimic API in "llm server"
+[ ] Add Autocert support.
+    Nobody wants their predictions running around the internet nekkid.
+[ ] Add support for API keys.
+    Give the server a list of API key hashes and add a "llm apikey" command to generate them.
+[ ] Add NGrok support.
+    Exposing a language model over NGrok will simplify using third party AI frontends, but we need to have API keys
+    first.
+
 Catch up on GGUF Changes
 [ ] Catch up to llama.cpp after their beta changes by only supporting loading GGUF for Llama. (We are currently on 
     dadbed99e65252d79f81101a392d0d6497b86caa)
 [ ] Add support for GGUF to Llama
-
-Support Language Models Over NATS
-[ ] Add a NATS client implementation of the llm.Interface that lets a frontend call a backend.
-    This would be a good example of how to use llama models in a distributed system, balancing the work across
-    multiple backends.  We probably want to support both Jetstream and normal NATS requests to get both (At Least One)
-    ATLO and ATMO (At Most One), since they serve different use cases and performance guarantees.
-[ ] Add a NATS server implentation compatible with the NATS client usable with LLM interface implementations.
-    This is specifically targeted at llama.cpp and other local LLMs, but this could also be used to separate API keys
-    from API consumers so we can just use NATS for authorization.
-[ ] Add a clean NATS example server, like io-worker, that shows how to run llama models on multiple hosts as backends
-    for a API / UI server.  Mimicking one of the other llama servers used by open source UIs and would make for a
-    better demo.
 
 Support Better Output Constraints
 [ ] Support for terminating predictions from Go.
@@ -45,3 +59,9 @@ Explore Adding RWKV
 [ ] Add RWKV as an LLM implementation alternate to Llama.  This uses GGML and is really pretty similar to llama.cpp,
     but having a second implemenation might keep the llm package from being the llama package in a fancy coat.
 
+Technical Documentation
+[ ] Document NATS setup.
+    A bootstrap task for llm might make life easier, setting up a TLS CA and generating certificates for the NATS
+    workers and clients.  This might be even nicer if we embed the NATS server.
+[ ] Document log/slog usage for clients to debug.
+[ ] Tutorial on NATS setup.
