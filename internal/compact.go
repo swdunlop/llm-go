@@ -40,7 +40,7 @@ func Compact(max int, instructions []int, contents [][]int) []int {
 		contentSize -= len(contents[0])
 		contents = contents[1:]
 	}
-}
+} // TODO: DELETE
 
 // An Encoder knows how to encode a string into a slice of tokens.
 type Encoder interface {

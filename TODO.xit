@@ -23,9 +23,13 @@ Support Language Models Over NATS
 [x] Add an option for client names to the NATS client.
 [x] Ensure that when the worker is cancelled, it signals error 8.
 [x] Ensure that when the client is cancelled, it sends an interrupt.
+[x] Add NATS parameters for NKey authorization and TLS certificate authority.
+[ ] When n_past exceeds n_ctx, compact the context and continue.
 [ ] Support specifying the model from a directory of models and loading on demand.
     This lets the client control which model is used.
 [ ] Support requesting a list of models.
+[ ] Review use of buffered channels for stream subscriptions.
+    This should not be necessary, but it seems like the results come back faster than we can output them.
 
 LLaMA Usability Improvements
 [x] Add "instructions" and make "content" an array of strings, not a single string.
@@ -33,17 +37,37 @@ LLaMA Usability Improvements
     instructions) and tells it how to edit down the content for generation (the content).
 [x] Add "llm settings" subcommand to list settings visible to the llm command.
     This can at least help show what could be set in the environment to control the llm command.
-[ ] Add functional predict and model options to improve llama usability.
+[x] Add functional predict and model options to improve llama usability.
     It's still really hard to understand all the options that llama supports, especially with the abstractions in 
     play.
-[ ] Adjust the generic interface to accept prediction configuration.
+[x] Adjust the generic interface to accept prediction configuration.
+[x] Drop complicated configuration interface for a map[string]string.
+    The configuration interface is a bit too complicated for what we need.  A simple map[string]string will do.
 [ ] Document ModelOptions and PrefixOptions understood by llama 
     The configuration model makes it harder to know what options are available.  Adding some markdown documentation to
     the package is needed.
 
 Bug Fixes for LLaMA
-[ ] If len(tokens) == 0, llama.Model.next will panic.  (Inherited from ollama)
-[ ] Why does llama.Model.Predict call the callback once with an empty output at the end of generation?
+[x] If len(tokens) == 0, llama.Model.next will panic.  (Inherited from ollama)
+[x] Ensure stop words actually stop producing words.
+    The stop words implementation has issues where it releases text to output that is part of a stop word, therefore
+    missing a stop word.
+[x] Rework llama, stripping out weird configuration state and exposing lower level eval / sample methods.
+[x] Ensure worker passes predict options on to the client.
+    Right now we have to set llm_stop in the worker environment along with other crap.
+[ ] Restore timing of eval, etc.
+[ ] Restore interruption and reuse of llm interface.
+[ ] Document or reimplement ggml-metal.metal hack
+    Ollama embeds this file, writing it to filepath.Dir(os.Args[0]), which is bound to upset read-only bin directories
+    like those found in Nix.
+[x] Why does llama.Model.Predict call the callback once with an empty output at the end of generation?
+    Does not happen now that it has been reworked.
+[ ] Dump superfluous configuration nonsense now that we have configuration structures and functional options.
+
+Restore Embedding Support
+[ ] Ollama.ai's implementation supported fetching the embedding and providing it again.
+    This is useful for applications that want to reuse embeddings to jumpstart predictions or use vector databases
+    to store and find similar embeddings for context.
 
 Support Language Models Over HTTP
 [ ] Implement "llm server", an HTTP service that can serve pluggable LLM models.

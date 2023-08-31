@@ -1,10 +1,6 @@
 // Package msg describes the protocol used between the NATS client and worker.
 package msg
 
-import (
-	"github.com/swdunlop/llm-go/configuration"
-)
-
 // WorkerRequest is sent to the worker on the worker subject ask it to do something on behalf of the client.  Only one
 // of the pointer fields should be non-nil.
 type WorkerRequest struct {
@@ -40,7 +36,7 @@ type PredictRequest struct {
 	Stream string `json:"stream,omitempty"`
 
 	// Options provides additional options used by the worker to perform the prediction.  This may be omitted or nil.
-	Options configuration.Map `json:"options,omitempty"`
+	Options map[string]string `json:"options,omitempty"`
 }
 
 // WorkerResponse is sent from the worker on the worker subject to reply to a WorkerRequest.  Only one of the pointer

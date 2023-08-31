@@ -1,5 +1,3 @@
-// Package llama provides a low level interface to llama1 and llama2-like models using llama.cpp.  It is more versatile
-// and less user friendly than the higher level llm package interface.
 package llama
 
 /*
@@ -12,7 +10,7 @@ package llama
 #include <stdlib.h>
 #include "llama.h"
 
-struct llama_sample_options
+struct llama_sample_params
 {
 	float repeat_penalty;
 	float frequency_penalty;
@@ -29,33 +27,33 @@ struct llama_sample_options
 };
 
 llama_token llama_sample(
-		struct llama_context *ctx,
-		struct llama_token_data *candidates,
-		size_t n_candidates,
-		const llama_token *last_tokens,
-		size_t n_last_tokens,
-		struct llama_sample_options *opts)
-{
+	struct llama_context *ctx,
+	struct llama_token_data *candidates, size_t n_candidates,
+	const llama_token *last_tokens, size_t n_last_tokens,
+	struct llama_sample_params *opts
+) {
 	llama_token_data_array candidates_p = {
 		candidates,
 		n_candidates,
 		false,
 	};
 
-	struct llama_token_data newline = candidates_p.data[llama_token_nl()];
+	if (n_last_tokens > 0) {
+		struct llama_token_data newline = candidates_p.data[llama_token_nl()];
 
-	llama_sample_repetition_penalty(
-		ctx, &candidates_p,
-		last_tokens, n_last_tokens,
-		opts->repeat_penalty);
+		llama_sample_repetition_penalty(
+			ctx, &candidates_p,
+			last_tokens, n_last_tokens,
+			opts->repeat_penalty);
 
-	llama_sample_frequency_and_presence_penalties(
-		ctx, &candidates_p,
-		last_tokens, n_last_tokens,
-		opts->frequency_penalty, opts->presence_penalty);
+		llama_sample_frequency_and_presence_penalties(
+			ctx, &candidates_p,
+			last_tokens, n_last_tokens,
+			opts->frequency_penalty, opts->presence_penalty);
 
-	if (!opts->penalize_newline) {
-		candidates_p.data[llama_token_nl()] = newline;
+		if (!opts->penalize_newline) {
+			candidates_p.data[llama_token_nl()] = newline;
+		}
 	}
 
 	if (opts->temperature <= 0) {
@@ -88,393 +86,569 @@ llama_token llama_sample(
 }
 */
 import "C"
-
 import (
-	"bytes"
 	"context"
-	"embed"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"strconv"
+	"math/rand"
+	"runtime"
 	"strings"
-	"sync"
-	"time"
-	"unicode/utf8"
 	"unsafe"
 
-	"github.com/pbnjay/memory"
 	"github.com/swdunlop/llm-go"
-	"github.com/swdunlop/llm-go/configuration"
 	"github.com/swdunlop/llm-go/internal"
-	"github.com/swdunlop/llm-go/internal/slog"
 )
-
-// Init configure things in llama.cpp that are not specific to the llama interface, specifically `LLAMA_USE_NUMA`.  If
-// you want to override runtime defaults, you should call this before calling other functions in this package.
-func Init(cf configuration.Interface) error {
-	initOnce.Do(func() {
-		if cf == nil {
-			cf = configuration.Environment(`LLAMA_`)
-		}
-		cf = configuration.Overlay{cf, configuration.Map{
-			`use_numa`:     {`true`},
-			`n_gpu_layers`: {`1`}, // 0 is CPU only, 1 enables GPU use on Metal
-		}}
-		var useNuma bool
-		err := configuration.Get(&useNuma, cf, `use_numa`)
-		if err != nil {
-			initError = err
-			return
-		}
-		C.llama_backend_init(C.bool(useNuma))
-		var numGPU int
-		err = configuration.Get(&numGPU, cf, `n_gpu_layers`)
-		if err != nil {
-			initError = err
-			return
-		}
-
-		defaultParams = C.llama_context_default_params()
-		defaultParams.n_gpu_layers = C.int(numGPU)
-		ncpu = numCPU()
-	})
-	return initError
-}
-
-var initOnce sync.Once
-var initError error
-var ncpu = 0
-var defaultParams C.struct_llama_context_params
-
-//go:embed ggml-metal.metal
-var fs embed.FS
 
 func init() {
-	llm.RegisterPredictor(`llama`, func(cf configuration.Interface) (llm.Predictor, error) {
-		modelOptions := ModelDefaults(``)
-		err := configuration.Unmarshal(modelOptions, cf)
+	llm.Register(`llama`, func(cf map[string]string) (llm.Interface, error) {
+		var model = struct {
+			Model string `json:"model"`
+			// TODO: Adapters
+			NumCtx int `json:"num_ctx"`
+			Seed   int `json:"seed"`
+		}{
+			NumCtx: 512,
+		}
+		err := llm.Unmap(cf, &model)
 		if err != nil {
 			return nil, err
 		}
-		m, err := New(modelOptions)
+		predict := PredictDefaults()
+		err = llm.Unmap(cf, &predict)
 		if err != nil {
 			return nil, err
 		}
-		err = configuration.Unmarshal(&m.predictOptions, cf)
+		err = llm.Unmap(cf, &predict.SampleOptions)
 		if err != nil {
 			return nil, err
 		}
-		return m, nil
+		options := []Option{
+			func(cfg *llama) { cfg.predictOptions = predict },
+			ModelFile(model.Model),
+			NCtx(model.NumCtx),
+			Metal(),                        // TODO: make this configurable
+			MLock(true),                    // TODO: make this configurable
+			MMap(true),                     // TODO: make this configurable
+			NThreads(runtime.NumCPU() - 2), // TODO: make this configurable
+			Seed(uint32(model.Seed)),       // TODO: support uint32 in unmarshal
+		}
+		return New(options...)
 	})
 }
 
-const modelFamilyLlama modelFamily = "llama"
-
-type llamaModel struct {
-	hyperparameters llamaHyperparameters
-}
-
-func (llm *llamaModel) ModelFamily() modelFamily {
-	return modelFamilyLlama
-}
-
-func (llm *llamaModel) ModelType() modelType {
-	switch llm.hyperparameters.NumLayer {
-	case 26:
-		return modelType3B
-	case 32:
-		return modelType7B
-	case 40:
-		return modelType13B
-	case 60:
-		return modelType30B
-	case 80:
-		return modelType65B
+func New(options ...Option) (Interface, error) {
+	var cfg llama
+	cfg.modelParams = C.llama_context_default_params()
+	for _, option := range options {
+		option(&cfg)
+		if cfg.err != nil {
+			return nil, cfg.err
+		}
 	}
-
-	// TODO(swdunlop): better to indicate an error than guess.
-	// TODO: find a better default
-	return modelType7B
+	err := cfg.init()
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
 
-func (llm *llamaModel) FileType() fileType {
-	return llm.hyperparameters.FileType
+type Interface interface {
+	llm.Interface
+
+	// PredictLlama predicts a stream of output until the model returns an EOS token, the context is cancelled or
+	// a stop token is encountered.
+	PredictLlama(ctx context.Context, content []string, options ...PredictOption) (string, error)
+
+	// ContextSize returns the number of tokens in the model context.
+	ContextSize() int
+
+	// Encode tokenizes the given text using the model.
+	Encode(text string) ([]Token, error)
+
+	// Decode detokenizes the given tokens using the model.
+	Decode(tokens ...Token) (string, error)
+
+	// Eval evaluates the given tokens using the model.
+	Eval(tokens []Token, nPast int) error
+
+	// Sample determines the next token using the model.
+	Sample(options ...SampleOption) (Token, error)
+
+	// PredictOptions returns the base predict options for the model.
+	PredictOptions() PredictOptions
+
+	// SampleOptions returns the base sample options for the model.
+	SampleOptions() SampleOptions
+
+	// BOS returns the Beginning of Stream token for the model.
+	BOS() Token
+
+	// EOS returns the End of Stream token for the model.
+	EOS() Token
+
+	// Release releases the resources associated with the model.
+	Release()
 }
 
-type llamaHyperparameters struct {
-	// NumVocab is the size of the model's vocabulary.
-	NumVocab uint32
-
-	// NumEmbd is the size of the model's embedding layer.
-	NumEmbd uint32
-	NumMult uint32
-	NumHead uint32
-
-	// NumLayer is the number of layers in the model.
-	NumLayer uint32
-	NumRot   uint32
-
-	// FileType describes the quantization level of the model, e.g. Q4_0, Q5_K, etc.
-	FileType llamaFileType
+// Metal enables Metal acceleration for the model, if running on a Mac.
+func Metal() Option {
+	return modelOption(func(p *modelParams) {
+		if runtime.GOOS == "darwin" {
+			p.n_gpu_layers = 1
+		}
+	})
 }
 
-type llamaFileType uint32
+// NThreads specifies the number of threads to use for evaluation, default is 1.
+func NThreads(n int) Option { return func(l *llama) { l.nThreads = n } }
 
-const (
-	llamaFileTypeF32 llamaFileType = iota
-	llamaFileTypeF16
-	llamaFileTypeQ4_0
-	llamaFileTypeQ4_1
-	llamaFileTypeQ4_1_F16
-	llamaFileTypeQ8_0 llamaFileType = iota + 2
-	llamaFileTypeQ5_0
-	llamaFileTypeQ5_1
-	llamaFileTypeQ2_K
-	llamaFileTypeQ3_K_S
-	llamaFileTypeQ3_K_M
-	llamaFileTypeQ3_K_L
-	llamaFileTypeQ4_K_S
-	llamaFileTypeQ4_K_M
-	llamaFileTypeQ5_K_S
-	llamaFileTypeQ5_K_M
-	llamaFileTypeQ6_K
-)
+// NCtx specifies the number of tokens in the model context, default is 512 but most LLaMA models support 2048 or
+// more as of August, 2023.
+func NCtx(n int) Option { return modelOption(func(p *modelParams) { p.n_ctx = C.int32_t(n) }) }
 
-func (ft llamaFileType) String() string {
-	switch ft {
-	case llamaFileTypeF32:
-		return "F32"
-	case llamaFileTypeF16:
-		return "F16"
-	case llamaFileTypeQ4_0:
-		return "Q4_0"
-	case llamaFileTypeQ4_1:
-		return "Q4_1"
-	case llamaFileTypeQ4_1_F16:
-		return "Q4_1_F16"
-	case llamaFileTypeQ8_0:
-		return "Q8_0"
-	case llamaFileTypeQ5_0:
-		return "Q5_0"
-	case llamaFileTypeQ5_1:
-		return "Q5_1"
-	case llamaFileTypeQ2_K:
-		return "Q2_K"
-	case llamaFileTypeQ3_K_S:
-		return "Q3_K_S"
-	case llamaFileTypeQ3_K_M:
-		return "Q3_K_M"
-	case llamaFileTypeQ3_K_L:
-		return "Q3_K_L"
-	case llamaFileTypeQ4_K_S:
-		return "Q4_K_S"
-	case llamaFileTypeQ4_K_M:
-		return "Q4_K_M"
-	case llamaFileTypeQ5_K_S:
-		return "Q5_K_S"
-	case llamaFileTypeQ5_K_M:
-		return "Q5_K_M"
-	case llamaFileTypeQ6_K:
-		return "Q6_K"
-	default:
-		return "Unknown"
+// ModelFile specifies the path to the model file which contains the model weights and other metadata.
+func ModelFile(path string) Option { return func(c *llama) { c.modelFile = path } }
+
+// MLock locks the model weights in memory, which can improve performance.
+func MLock(ok bool) Option { return modelOption(func(p *modelParams) { p.use_mlock = C.bool(ok) }) }
+
+// MMap maps the model file into memory instead of reading it, which may improve load speed.
+func MMap(ok bool) Option { return modelOption(func(p *modelParams) { p.use_mmap = C.bool(ok) }) }
+
+// Seed specifies the random seed to use for sampling, default is 0, which generates a new random seed at startup.
+func Seed(seed uint32) Option { return func(l *llama) { l.seed = seed } }
+
+// Temperature specifies the sampling temperature, default is 1.0.  Higher temperatures generate more random samples,
+// lower temperatures generate more deterministic samples.  If temperature is 0 or lower, greedy sampling is used
+// instead, with the most probable token always being selected.
+func Temperature(t float32) SampleOption {
+	return func(opts *SampleOptions) { opts.Temperature = t }
+}
+
+func modelOption(fn func(p *modelParams)) Option {
+	return func(cfg *llama) {
+		if cfg.initialized {
+			// TODO: support re-starting the context with new options
+			return // ignore model options after initialization
+		}
+		fn(&cfg.modelParams)
 	}
 }
 
-// Model combines a llama model with its context.  Models are not safe for concurrent use, particularly while performing
-// a prediction.
-type Model struct {
-	params *C.struct_llama_context_params
-	model  *C.struct_llama_model
-	tokens *C.struct_llama_context
+type Option func(*llama)
 
-	last   []C.llama_token
-	embd   []C.llama_token
-	cursor int
+type llama struct {
+	initialized    bool
+	modelParams    modelParams
+	modelFile      string
+	seed           uint32
+	nThreads       int
+	predictOptions PredictOptions
+	err            error
 
-	mu sync.Mutex
-	gc bool
-
-	ModelOptions
-	predictOptions PredictOptions // only used for Predict, not PredictLlama
+	model *C.struct_llama_model
+	llama *C.struct_llama_context
 }
 
-// ModelOptions controls how the model (and its context) are initialized.  These settings, their names and defaults
-// come from llama.cpp -- see https://github.com/ggerganov/llama.cpp/tree/master/examples/main for explanations of
-// common settings.
-type ModelOptions struct {
-	Model    string   `json:"model"`
-	Adapters []string `json:"adapters"`
+type sampleParams = C.struct_llama_sample_params
 
-	// NumCtx limits the size of the prompt context.  The llama.cpp default is 512, but LLaMA models are typically
-	// built with a context size of 2048, as of August 2023.
-	NumCtx int `json:"n_ctx,omitempty"`
-
-	NumBatch      int     `json:"n_batch,omitempty"`
-	NumGQA        int     `json:"n_gqa,omitempty"`
-	RMSNormEps    float32 `json:"rms_norm_eps,omitempty"`
-	NumGPU        int     `json:"n_gpu,omitempty"`
-	MainGPU       int     `json:"main_gpu,omitempty"`
-	LowVRAM       bool    `json:"low_vram,omitempty"`
-	F16KV         bool    `json:"f16_kv,omitempty"`
-	LogitsAll     bool    `json:"logits_all,omitempty"`
-	VocabOnly     bool    `json:"vocab_only,omitempty"`
-	UseMMap       bool    `json:"use_mmap,omitempty"`
-	UseMLock      bool    `json:"use_mlock,omitempty"`
-	EmbeddingOnly bool    `json:"embedding_only,omitempty"`
-
-	// RopeFrequencyBase specifies the base frequency of the rope model.  This is used with some fine tuned models to
-	// increase the context size, see your model for this value and the scale.
-	RopeFrequencyBase float32 `json:"rope_freq_base,omitempty"`
-
-	// RopeFrequencyScale specifies the scale of the rope model.  See RopeFrequencyBase and your model for more info.
-	RopeFrequencyScale float32 `json:"rope_freq_scale,omitempty"`
-
-	// NumThread is the number of threads to use when initializing the model.  The llama.cpp default is 1, but this
-	// package will default to use the number of performance CPUs on the system.  (On big.LITTLE systems, not all
-	// CPUs are created equal.)
-	NumThread int `json:"n_threads,omitempty"`
-
-	// TODO: is there n_predict in llama.go?
+func (cfg *llama) init() error {
+	cfg.initialized = true
+	cfg.model = C.llama_load_model_from_file(C.CString(cfg.modelFile), cfg.modelParams)
+	if cfg.model == nil {
+		return fmt.Errorf("failed to load %q", cfg.modelFile)
+	}
+	cfg.llama = C.llama_new_context_with_model(cfg.model, cfg.modelParams)
+	if cfg.llama == nil {
+		return fmt.Errorf("failed to create context from model %q", cfg.modelFile)
+	}
+	boot := []Token{cfg.BOS()}
+	return cfg.Eval(boot, 0)
 }
 
-// PredictOptions controls how the model generates text.  These settings mostly handle how the model's output is
-// processed when predicting text.  Like ModelOptions, these names and defaults come from llama.cpp.
-type PredictOptions struct {
-	// Seed is the random seed used to generate text.  If -1, a random seed is chosen on each call to Predict.
-	Seed int `json:"seed,omitempty"`
+// Encode tokenizes the given text using the model.
+func (cfg *llama) Encode(text string) ([]Token, error) {
+	ctext := C.CString(text)
+	defer C.free(unsafe.Pointer(ctext))
 
-	// TODO: this is not yet implemented
-	// NumPredict limits the number of tokens to predict.  The llama.cpp default is 128.  -1 will predict an unlimited
-	// number of tokens and -2 will predict until the context is filled.  If a model reaches the end of its context
-	// space, it must do another pass with a diminished context.
-	// NumPredict int `json:"n_predict,omitempty"`
-
-	// RepeatPenalty controls the repetition of token sequences in the generated text (default: 1.1).
-	RepeatPenalty float32 `json:"repeat_penalty,omitempty"`
-
-	// RepeatLastN controls the number of tokens to consider when repeating tokens.  The llama.cpp default is 64, 0
-	// will disable the repeat penalty, and -1 will consider the entire context.
-	RepeatLastN int `json:"repeat_last_n,omitempty"`
-
-	FrequencyPenalty float32 `json:"frequency_penalty,omitempty"`
-	PresencePenalty  float32 `json:"presence_penalty,omitempty"`
-
-	// Temperature controls the randomness of the model's output.  The llama.cpp default is 0.8.  Higher temperatures
-	// will encourage the model to generate more diverse text, but increases the likelihood of nonsense.  Lower
-	// temperatures increase the likelihood of repetition and regurgitating training (or training-like) data.
-	Temperature float32 `json:"temperature,omitempty"`
-
-	// TopK sampling limits the next token selection to the K most probable tokens (default: 40).  A higher value will
-	// increase the diversity of the model's output, but may increase the likelihood of nonsense.
-	TopK int `json:"top_k,omitempty"`
-
-	// TopP sampling limits the next token selection to the smallest set of tokens whose cumulative probability is at
-	// least P (default: 0.9).  A higher value will increase the diversity of the model's output, but may increase the
-	// likelihood of nonsense.
-	TopP float32 `json:"top_p,omitempty"`
-
-	// TFSZ enables tail free sampling.  The default is 1.0, which disables TFSZ.  Typical values are in the range of
-	// 0.9 to 0.95.
-	TFSZ float32 `json:"tfs_z,omitempty"`
-
-	// TypicalP enables locally typical sampling with parameter p (default: 1.0, 1.0 = disabled).
-	TypicalP float32 `json:"typical_p,omitempty"`
-
-	// Enable Mirostat sampling, controlling perplexity during text generation (default: 0, 0 = disabled, 1 = Mirostat,
-	// 2 = Mirostat 2.0).  If Mirostat is enabled, MirostatTau and MirostatEta
-	Mirostat int `json:"mirostat,omitempty"`
-
-	// MirostatTau specifies the target entropy of the Mirostat distribution.
-	MirostatTau float32 `json:"mirostat_tau,omitempty"`
-
-	// MirostatEta specifies the learning rate of the Mirostat distribution.
-	MirostatEta float32 `json:"mirostat_eta,omitempty"`
-
-	PenalizeNewline bool `json:"penalize_newline,omitempty"`
-
-	// Stop is a list of Unicode strings that, if found in the generated output, will stop output generation.
-	Stop []string `json:"stop,omitempty"`
-
-	// Instructions provide content that will always be included in the context when predicting tokens, unlike the
-	// initial content, which may be edited down to make room for prediction.
-	Instructions string `json:"instructions,omitempty"`
-
-	// references:
-	// - https://github.com/ggerganov/llama.cpp/blob/master/examples/server
-	// - https://github.com/ggerganov/llama.cpp/tree/master/examples/main
+	buf := make([]Token, len(text))
+	// TODO: should we consider support BOS?
+	n := C.llama_tokenize(cfg.llama, ctext, unsafe.SliceData(buf), C.int(len(buf)), false)
+	if n < 0 {
+		return nil, errors.New(`llama_tokenize failed`)
+	}
+	return buf[:n], nil
 }
 
-// RuntimeDefault provides a default configuration for llama models and predictions, looking at the runtime
-// configuration of the host.  (Specifically, what is its OS, CPU architecture, and number of CPUs.)
-func RuntimeDefault() configuration.Interface {
-	return configuration.Overlay{
-		configuration.Map{
-			`n_threads`: []string{strconv.Itoa(numCPU())},
-		},
-		Defaults(),
+// Decode detokenizes the given tokens using the model.
+func (cfg *llama) Decode(tokens ...Token) (string, error) {
+	var buf strings.Builder
+	buf.Grow(len(tokens) * 4)
+	// TODO: is this lock necessary?
+	for _, token := range tokens {
+		// TODO: what is the difference between llama_token_to_str and llama_token_to_piece ?
+		cstr := C.llama_token_to_str(cfg.llama, token)
+		if cstr == nil {
+			return buf.String(), fmt.Errorf(`llama_token_to_str %v failed`, token)
+		}
+		buf.WriteString(C.GoString(cstr))
+	}
+	return buf.String(), nil
+}
+
+// Predict implements the llm.Predictor interface.
+func (cfg *llama) Predict(ctx context.Context, cf map[string]string, content []string, fn func(llm.Prediction) error) (string, error) {
+	return cfg.PredictLlama(ctx, content,
+		PredictConfiguration(cf),
+		Callback(func(p *Prediction) error { return fn(p) }),
+	)
+}
+
+// Predict returns the most likely tokens for the given context.
+func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ...PredictOption) (out string, err error) {
+	opts := cfg.predictOptions
+	for _, opt := range options {
+		opt(&opts)
+		if opts.err != nil {
+			return ``, opts.err
+		}
+	}
+	var params sampleParams
+	opts.setParams(&params)
+
+	instructions, err := cfg.Encode(opts.Instructions)
+	if err != nil {
+		return ``, err
+	}
+	keep := len(instructions)
+	max := (int(cfg.modelParams.n_ctx) - keep) * 3 / 4 // 75% of non-instruction context is available for content.
+
+	contentTokens, err := cfg.inputTokens(content)
+	tokens := compact(max, instructions, contentTokens)
+	if tokens == nil {
+		return ``, fmt.Errorf(`content and instructions overflow context size %v`, cfg.modelParams.n_ctx)
+	}
+	filter := internal.NewStopFilter(opts.Stop...)
+	past := 0
+
+	var buf strings.Builder
+	buf.Grow(16384)
+	defer func() {
+		buf.WriteString(filter.String())
+		out = buf.String()
+	}()
+
+	eos := cfg.EOS()
+	for {
+		var text string
+		if err = ctx.Err(); err != nil {
+			return
+		}
+		// text, _ := cfg.Decode(tokens...)
+		// fmt.Printf("predicting %q past %v\n", text, past)
+		err = cfg.Eval(tokens, past)
+		if err != nil {
+			return
+		}
+		past += len(tokens)
+		var token Token
+		token, err = cfg.sample(&params, nil) // TODO: provide rest.
+		if err != nil {
+			return
+		}
+		if token == eos {
+			return
+		}
+		tokens[0] = token
+		tokens = tokens[:1]
+		// var text string
+		text, err = cfg.Decode(token)
+		if err != nil {
+			return
+		}
+		// fmt.Printf("filtering %q\n", text)
+		text, stop := filter.Filter(text)
+		if text != `` {
+			buf.WriteString(text)
+			if opts.callback != nil {
+				err = opts.callback(&Prediction{Output: text})
+				if err != nil {
+					// TODO: output the buffer, not just the filter.
+					return
+				}
+			}
+		}
+		// TODO: look for EOS token
+		if stop {
+			return
+		}
 	}
 }
 
-// Defaults returns a default configuration for llama models and prediction that is not dependent on the host.
-func Defaults() configuration.Interface {
-	// f := func(v any) []string { return []string{fmt.Sprint(v)} }
-	generateDefaultsOnce.Do(func() {
-		model := ModelDefaults(``)
+func (cfg *llama) inputTokens(inputs []string) ([][]Token, error) {
+	ret := make([][]Token, len(inputs))
+	for i, input := range inputs {
 		var err error
-		generatedDefaults, err = configuration.Marshal(model)
+		ret[i], err = cfg.Encode(input)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-	})
-	return generatedDefaults
+	}
+	return ret, nil
 }
+
+// Eval evaluates the given batch of tokens using the model.
+func (cfg *llama) Eval(batch []Token, nPast int) error {
+	if nPast >= int(cfg.modelParams.n_ctx) {
+		return fmt.Errorf(`%w %v`, errPastOverflow{}, cfg.modelParams.n_ctx)
+	}
+	seed := cfg.seed
+	if seed < 1 {
+		seed = rand.Uint32()
+	}
+	C.llama_set_rng_seed(cfg.llama, C.uint32_t(seed))
+	C.llama_reset_timings(cfg.llama)
+	// TODO: if nPast exceeds the context size, we must reset.
+	res := C.llama_eval(cfg.llama, unsafe.SliceData(batch), C.int(len(batch)), C.int(nPast), C.int(cfg.nThreads))
+	if res != 0 {
+		return errors.New("llama_eval failed")
+	}
+	return nil
+}
+
+type errPastOverflow struct{}
+
+func (errPastOverflow) Error() string { return `past overflows context limit` }
+
+// Sample selects the most likely token from the model after Eval.  The recent slice is used by the "recent" options
+// to penalize tokens that have recently been selected.
+func (cfg *llama) Sample(options ...SampleOption) (Token, error) {
+	opts := cfg.predictOptions.SampleOptions
+	for _, opt := range options {
+		opt(&opts)
+		if opts.err != nil {
+			return 0, opts.err
+		}
+	}
+	var params sampleParams
+	opts.setParams(&params)
+	return cfg.sample(&params, opts.recent)
+}
+
+func (cfg *llama) sample(params *sampleParams, recent []Token) (Token, error) {
+	// TODO: this is a /large/ allocation, n_vocab is 32000 for llama2
+	numVocab := C.llama_n_vocab(cfg.llama)
+	logits := unsafe.Slice(C.llama_get_logits(cfg.llama), numVocab)
+	candidates := make([]C.llama_token_data, numVocab)
+	for i := range logits {
+		candidates[i] = C.llama_token_data{
+			id:    C.int(i),
+			logit: logits[i],
+			p:     0,
+		}
+	}
+
+	var recentPtr *Token
+	var recentLen C.size_t
+	if recent != nil {
+		recentPtr = unsafe.SliceData(recent)
+		recentLen = C.size_t(len(recent))
+	}
+
+	return Token(C.llama_sample(
+		cfg.llama,
+		unsafe.SliceData(candidates),
+		C.size_t(len(candidates)),
+		recentPtr, recentLen,
+		params,
+	)), nil
+}
+
+// PredictOptions are options for Predict.
+func (cfg *llama) PredictOptions() PredictOptions { return cfg.predictOptions }
+
+// SampleOptions are options for Sample.
+func (cfg *llama) SampleOptions() SampleOptions { return cfg.predictOptions.SampleOptions }
+
+// BOS returns the Beginning of Stream token for the model.
+func (cfg *llama) BOS() Token { return llamaBOS }
+
+// EOS returns the End of Stream token for the model.
+func (cfg *llama) EOS() Token { return llamaEOS }
 
 var (
-	generateDefaultsOnce sync.Once
-	generatedDefaults    configuration.Interface
+	llamaBOS = C.llama_token_bos()
+	llamaEOS = C.llama_token_eos()
 )
 
-// ModelDefaults returns the llama.cpp defaults parameters for a model, and sets the "Model" field to the provided
-// string.
-func ModelDefaults(model string) *ModelOptions {
-	err := Init(nil)
-	if err != nil {
-		panic(err)
+func (cfg *llama) Release() {
+	if cfg.llama != nil {
+		C.llama_free(cfg.llama)
+		cfg.llama = nil
 	}
-	return &ModelOptions{
-		Model:      model,
-		NumCtx:     int(defaultParams.n_ctx),
-		NumBatch:   int(defaultParams.n_batch),
-		NumGPU:     int(defaultParams.n_gpu_layers),
-		NumGQA:     int(defaultParams.n_gqa),
-		RMSNormEps: float32(defaultParams.rms_norm_eps),
-		// TODO: add tensor_split
-		LowVRAM:            bool(defaultParams.low_vram),
-		F16KV:              bool(defaultParams.f16_kv),
-		LogitsAll:          bool(defaultParams.logits_all),
-		VocabOnly:          bool(defaultParams.vocab_only),
-		RopeFrequencyBase:  float32(defaultParams.rope_freq_base),
-		RopeFrequencyScale: float32(defaultParams.rope_freq_scale),
-		UseMMap:            bool(defaultParams.use_mmap),
-		UseMLock:           bool(defaultParams.use_mlock),
-		EmbeddingOnly:      true, // TODO: bool(defaultParams.embedding),
+	// TODO: split the model, context and sampling apart into their own types so they can be shared and released
+	// properly.
+	if cfg.model != nil {
+		C.llama_free_model(cfg.model)
+		cfg.model = nil
 	}
 }
 
-// PredictDefaults returns the default prediction options for llama models.  Note that this has a lot of impact on the
-// balance of stability against creativity in the model's output.
-func PredictDefaults() *PredictOptions {
-	err := Init(nil)
-	if err != nil {
-		panic(err)
+func (cfg *llama) ContextSize() int { return int(cfg.modelParams.n_ctx) }
+
+type modelParams = C.struct_llama_context_params
+
+// compact will use the provided encoder to encode the combination of prefix, content and suffix, producing a slice of
+// tokens that has the following properties:
+//
+//  1. The number of tokens is less than or equal to max.  If this is not possible, nil is returned.
+//  2. All of the tokens from the prefix and suffix are included.
+//  3. As many tokens as possible from the content are included.
+//
+// This is done by dropping lines of text from the front of the content until it fits.  Some assumptions are made, here:
+// that text is peppered with newlines, that newlines have a single unambiguous encoding, and that the encoder will
+// produce the same encoding for the same input.  This is true for LLaMA encoders.
+func compact(max int, instructions []Token, contents [][]Token) []Token {
+	n := len(instructions)
+	max -= len(instructions)
+	if max < 0 {
+		return nil // not enough space for prefix and suffix
 	}
-	return &PredictOptions{
-		Seed: -1,
-		// NumPredict:       128,
-		RepeatLastN:      64,
+	contentSize := 0
+	for _, content := range contents {
+		contentSize += len(content)
+	}
+	buf := make([]Token, n, max)
+	copy(buf, instructions)
+	for {
+		if contentSize <= max {
+			for _, content := range contents {
+				buf = append(buf, content...)
+			}
+			return buf
+		}
+		if len(contents) == 1 {
+			// This is desperate, since the start of the content is likely to be a fragmented token or the content
+			// itself is fragmented.
+			content := contents[0]
+			return append(buf, content[contentSize-max:]...)
+		}
+		contentSize -= len(contents[0])
+		contents = contents[1:]
+	}
+}
+
+// A Token is a single token understood by a LLaMA model.
+type Token = C.int32_t
+
+// Sample adds sampling options that modify every call to Sample.
+func Sample(options ...SampleOption) Option {
+	return func(cfg *llama) {
+		for _, option := range options {
+			option(&cfg.predictOptions.SampleOptions)
+			if cfg.predictOptions.SampleOptions.err != nil {
+				cfg.err = cfg.predictOptions.SampleOptions.err
+				return
+			}
+		}
+	}
+}
+
+// Predict adds options that modify every call to Predict.
+func Predict(options ...PredictOption) Option {
+	return func(cfg *llama) {
+		for _, option := range options {
+			option(&cfg.predictOptions)
+			if cfg.predictOptions.err != nil {
+				cfg.err = cfg.predictOptions.err
+				return
+			}
+		}
+	}
+}
+
+// Stop replaces the set of stop tokens used by Predict.
+func Stop(stop ...string) PredictOption {
+	return func(opts *PredictOptions) {
+		opts.Stop = stop
+	}
+}
+
+func PredictConfiguration(cf map[string]string) PredictOption {
+	return func(opts *PredictOptions) {
+		opts.err = llm.Unmap(cf, opts)
+	}
+}
+
+// Callback sets a callback that will be called every time predict outputs tokens that cannot involve a stop token.
+func Callback(fn func(*Prediction) error) PredictOption {
+	return func(opts *PredictOptions) {
+		opts.callback = fn
+	}
+}
+
+// A PredictOption modifies the behavior of Predict.
+type PredictOption func(*PredictOptions)
+
+// PredictOptions controls the behavior of Predict.
+type PredictOptions struct {
+	SampleOptions // options that modify every call to Sample, which is a part of Prediction.
+
+	// Instruction is a string that will always be in context when predicting.  This is typically used for things like
+	// instructions to the model that should always be present.
+	//
+	// The more instructions you have, the less of the context will be used for recent input, so use this sparingly.
+	Instructions string `json:"instructions"`
+
+	// Stop is a list of strings that, if they occur in the output, will cause prediction to stop and they will be
+	// omitted from the output.  This is typically used for things like reverse prompts.
+	Stop []string `json:"stop"`
+
+	callback func(*Prediction) error
+}
+
+// Recent provides Sample with a slice of recent tokens for penalizing recently selected tokens.
+func Recent(tokens []Token) func(*SampleOptions) {
+	return func(opts *SampleOptions) {
+		opts.recent = tokens
+	}
+}
+
+// A SampleOption modifies the behavior of Sample.
+type SampleOption func(*SampleOptions)
+
+// SampleOptions controls sampling used to choose a token.
+type SampleOptions struct {
+	RepeatPenalty    float32 `json:"repeat_penalty"`
+	FrequencyPenalty float32 `json:"frequency_penalty"`
+	PresencePenalty  float32 `json:"presence_penalty"`
+	Temperature      float32 `json:"temperature"`
+	TopK             int     `json:"top_k"`
+	TopP             float32 `json:"top_p"`
+	TFSZ             float32 `json:"tfs_z"`
+	TypicalP         float32 `json:"typical_p"`
+	Mirostat         int     `json:"mirostat"`
+	MirostatTau      float32 `json:"mirostat_tau"`
+	MirostatEta      float32 `json:"mirostat_eta"`
+	PenalizeNewline  bool    `json:"penalize_newline"`
+
+	recent []Token `json:"-"`
+	err    error   `json:"-"`
+}
+
+// PredictDefaults provides a set of default prediction options.
+func PredictDefaults() PredictOptions {
+	return PredictOptions{
+		SampleOptions: SampleDefaults(),
+		Instructions:  "",
+		Stop:          nil,
+		callback:      nil,
+	}
+}
+
+// SampleDefaults provides a set of default sampling options.
+func SampleDefaults() SampleOptions {
+	return SampleOptions{
 		RepeatPenalty:    1.1,
 		FrequencyPenalty: 0.0,
 		PresencePenalty:  0.0,
@@ -490,478 +664,26 @@ func PredictDefaults() *PredictOptions {
 	}
 }
 
-// New creates a new interface from a configuration.
-func New(options *ModelOptions) (*Model, error) {
-	err := Init(nil)
-	if err != nil {
-		return nil, err
-	}
-	if options == nil {
-		return nil, errors.New(`model options must be provided`)
-	}
-	if options.NumThread == 0 {
-		options.NumThread = numCPU() // we are outsmarting llama.cpp here, at our peril.
-	}
-	if options.NumGQA == 0 {
-		return nil, errors.New(`n_gqa must be set`)
-	}
-	llm := new(Model)
-	llm.ModelOptions = *options
-	llm.predictOptions = *PredictDefaults()
-
-	// TODO(swdunlop): split prediction and model options apart.
-	if _, err := os.Stat(llm.ModelOptions.Model); err != nil {
-		return nil, err
-	}
-
-	f, err := os.Open(llm.ModelOptions.Model)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close() //TODO(swdunlop): we really don't need the file open the whole time we load this.
-
-	//TODO(swdunlop): do we need decodeGGML at all? shouldn't we just use the llama.cpp API for this?
-	//TODO(swdunlop): if we do, we should move this to a separate package and add gguf as well.
-	//TODO(swdunlop): if we don't, how do we load older GGML models? do we have to offer a converter?
-	ggml, err := decodeGGML(f, modelFamilyLlama)
-	if err != nil {
-		return nil, err
-	}
-
-	switch ggml.FileType().String() {
-	case "F32", "F16", "Q5_0", "Q5_1", "Q8_0":
-		if llm.ModelOptions.NumGPU != 0 {
-			// F32, F16, Q5_0, Q5_1, and Q8_0 do not support Metal API and will cause the runner to segmentation fault
-			return nil, fmt.Errorf("GPU acceleration not available for GGML model types F32, F16, Q5_0, Q5_1, and Q8_0")
-		}
-	}
-
-	totalResidentMemory := memory.TotalMemory()
-	switch ggml.ModelType() {
-	case modelType3B, modelType7B:
-		if totalResidentMemory < 8*1024*1024 {
-			return nil, fmt.Errorf("model requires at least 8GB of memory")
-		}
-	case modelType13B:
-		if totalResidentMemory < 16*1024*1024 {
-			return nil, fmt.Errorf("model requires at least 16GB of memory")
-		}
-	case modelType30B:
-		if totalResidentMemory < 32*1024*1024 {
-			return nil, fmt.Errorf("model requires at least 32GB of memory")
-		}
-	case modelType34B:
-		if totalResidentMemory < 38*1024*1024 {
-			return nil, fmt.Errorf("model requires at least 38GB of memory")
-		}
-	case modelType65B:
-		if totalResidentMemory < 64*1024*1024 {
-			return nil, fmt.Errorf("model requires at least 64GB of memory")
-		}
-	}
-
-	switch ggml.ModelFamily() {
-	case modelFamilyLlama:
-	default:
-		return nil, fmt.Errorf("unknown ggml type: %s", ggml.ModelFamily())
-	}
-
-	params := defaultParams
-	params.n_ctx = C.int(llm.NumCtx)
-	params.n_batch = C.int(llm.NumBatch)
-	params.n_gqa = C.int(llm.NumGQA)
-	params.rms_norm_eps = C.float(llm.RMSNormEps)
-	params.n_gpu_layers = C.int(llm.NumGPU)
-	params.main_gpu = C.int(llm.MainGPU)
-	params.low_vram = C.bool(llm.LowVRAM)
-	params.f16_kv = C.bool(llm.F16KV)
-	params.logits_all = C.bool(llm.LogitsAll)
-	params.vocab_only = C.bool(llm.VocabOnly)
-	params.use_mmap = C.bool(llm.UseMMap)
-	params.use_mlock = C.bool(llm.UseMLock)
-	params.embedding = C.bool(llm.EmbeddingOnly)
-	params.rope_freq_base = C.float(llm.RopeFrequencyBase)
-	params.rope_freq_scale = C.float(llm.RopeFrequencyScale)
-
-	if len(llm.ModelOptions.Adapters) > 0 && llm.UseMMap {
-		return nil, fmt.Errorf(`you cannot combine mmap with lora adapters`)
-	}
-
-	llm.params = &params
-
-	cModel := C.CString(llm.ModelOptions.Model)
-	defer C.free(unsafe.Pointer(cModel))
-
-	llm.model = C.llama_load_model_from_file(cModel, params)
-	if llm.model == nil {
-		return nil, errors.New("failed to load model")
-	}
-
-	llm.tokens = C.llama_new_context_with_model(llm.model, params)
-	if llm.tokens == nil {
-		return nil, errors.New("failed to create context")
-	}
-
-	for _, adapter := range llm.ModelOptions.Adapters {
-		cAdapter := C.CString(adapter)
-		defer C.free(unsafe.Pointer(cAdapter))
-
-		if retval := C.llama_model_apply_lora_from_file(llm.model, cAdapter, nil, C.int(llm.NumThread)); retval != 0 {
-			return nil, fmt.Errorf("failed to load adapter %s", adapter)
-		}
-	}
-
-	// warm up the model
-	bos := []C.llama_token{C.llama_token_bos()}
-	C.llama_eval(llm.tokens, unsafe.SliceData(bos), C.int(len(bos)), 0, C.int(llm.ModelOptions.NumThread))
-	C.llama_reset_timings(llm.tokens)
-
-	return llm, nil
+func (opts *SampleOptions) setParams(ref *C.struct_llama_sample_params) {
+	ref.repeat_penalty = C.float(opts.RepeatPenalty)
+	ref.frequency_penalty = C.float(opts.FrequencyPenalty)
+	ref.presence_penalty = C.float(opts.PresencePenalty)
+	ref.temperature = C.float(opts.Temperature)
+	ref.top_k = C.int(opts.TopK)
+	ref.top_p = C.float(opts.TopP)
+	ref.tfs_z = C.float(opts.TFSZ)
+	ref.typical_p = C.float(opts.TypicalP)
+	ref.mirostat = C.int(opts.Mirostat)
+	ref.mirostat_tau = C.float(opts.MirostatTau)
+	ref.mirostat_eta = C.float(opts.MirostatEta)
+	ref.penalize_newline = C.bool(opts.PenalizeNewline)
 }
 
-func (m *Model) Release() {
-	m.gc = true
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	defer C.llama_free_model(m.model)
-	defer C.llama_free(m.tokens)
-}
-
-var errNeedMoreData = errors.New("need more data")
-
-// Predict implements the llm.Predictor interface by exchanging strings with tokens and using PredictOptions from
-// model instantation time.
-func (m *Model) Predict(ctx context.Context, content []string, fn func(llm.Prediction) error) (string, error) {
-	tokens := make([]int, 0, 4096)
-	err := m.PredictLlama(ctx, &m.predictOptions, content, func(p *Prediction) error {
-		tokens = append(tokens, p.Response...)
-		err := fn(p)
-		return err
-	})
-	return m.Decode(tokens...), err
-}
-
-// PredictLlama is a more low level implementation of Predict that lets you specify the prediction options for each
-// call.
-func (m *Model) PredictLlama(ctx context.Context, options *PredictOptions, contents []string, fn func(*Prediction) error) error {
-	if options.Instructions == "" && contentsEmpty(contents) {
-		return fmt.Errorf(`no content or instructions provided for prediction`)
-	}
-
-	instructions := m.Encode(options.Instructions)
-	// TODO: incorporate NumPredict if > 0
-	keep := len(instructions)
-	max := (m.ModelOptions.NumCtx - keep) * 3 / 4 // 75% of non-instruction context is available for content.
-	rem := m.ModelOptions.NumCtx - keep - max
-	if rem < 4 {
-		return fmt.Errorf(`not enough context capacity for instructions and content`)
-	}
-
-	tokens := internal.Compact(max, instructions, m.contentTokens(contents))
-	if tokens == nil {
-		panic(fmt.Errorf(`failed to detect instructions exceeding context capacity`))
-	}
-	if len(tokens) == 0 {
-		panic(fmt.Errorf(`failed to detect lack of instructions and content`))
-	}
-
-	C.llama_reset_timings(m.tokens)
-	m.marshalPrompt(options, tokens)
-	C.llama_set_rng_seed(m.tokens, C.uint(options.Seed))
-
-	slog.From(ctx).Debug(`predicting`, `options`, options, `contentSz`, len(tokens), `maxSz`, max, `instructionSz`, keep)
-
-	var p Prediction
-	p.model = m
-	p.Response = make([]int, 0, 16)
-	var b bytes.Buffer
-	for {
-		token, err := m.next(ctx, options, keep)
-		if m.gc {
-			return nil
-		} else if errors.Is(err, io.EOF) {
-			break
-		} else if err != nil {
-			return err
-		}
-		p.Response = append(p.Response, int(token))
-
-		b.WriteString(m.Decode(int(token))) //TODO: this looks suspiciously inefficient.
-
-		if err := m.checkStopConditions(options, b); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			} else if errors.Is(err, errNeedMoreData) {
-				continue
-			}
-
-			return err
-		}
-
-		if utf8.Valid(b.Bytes()) || b.Len() >= utf8.UTFMax {
-			err := fn(&p)
-			if err != nil {
-				return err
-			}
-			b.Reset()
-			p.Response = p.Response[0:0:cap(p.Response)]
-		}
-	}
-	return fn(&Prediction{Done: true})
-}
-
-func contentsEmpty(contents []string) bool {
-	for _, content := range contents {
-		if len(content) > 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func (m *Model) contentTokens(content []string) [][]int {
-	tokens := make([][]int, len(content))
-	for i, c := range content {
-		tokens[i] = m.Encode(c)
-	}
-	return tokens
-}
-
-func (llm *Model) checkStopConditions(options *PredictOptions, b bytes.Buffer) error {
-	for _, stopCondition := range options.Stop {
-		if stopCondition == strings.TrimSpace(b.String()) {
-			return io.EOF
-		} else if strings.HasPrefix(stopCondition, strings.TrimSpace(b.String())) {
-			return errNeedMoreData
-		}
-	}
-
-	return nil
-}
-
-func (llm *Model) marshalPrompt(options *PredictOptions, ctx []int) []C.llama_token {
-	tokenCt := len(ctx)
-	cTokens := make([]C.llama_token, tokenCt)
-	for i := range ctx {
-		cTokens[i] = C.llama_token(ctx[i])
-	}
-
-	llm.last = make([]C.llama_token, llm.NumCtx-len(cTokens))
-	llm.last = append(llm.last, cTokens...)
-
-	var i int
-	for i = 0; i < len(llm.embd) && i < len(cTokens) && llm.embd[i] == cTokens[i]; i++ {
-		// noop
-	}
-
-	llm.embd = cTokens
-	if i == len(cTokens) {
-		// evaluate at least one token to generate logits
-		i--
-	}
-
-	llm.cursor = i
-	return cTokens
-}
-
-// Encode returns the encoded tokens for the given text, which is model specific.  These tokens can be passed to
-// PredictLLama, decoded with Decode, or used to extract embeddings.
-func (llm *Model) Encode(text string) []int {
-	cPrompt := C.CString(text)
-	defer C.free(unsafe.Pointer(cPrompt))
-
-	cTokens := make([]C.llama_token, len(text)+1)
-	if n := C.llama_tokenize(llm.tokens, cPrompt, unsafe.SliceData(cTokens), C.int(len(cTokens)), true); n > 0 {
-		tokens := make([]int, n)
-		for i := range cTokens[:n] {
-			tokens[i] = int(cTokens[i])
-		}
-
-		return tokens
-	}
-
-	return nil
-}
-
-// Decode converts a slice of tokens into a string.  Note that this string may not be valid UTF-8.
-func (llm *Model) Decode(tokens ...int) string {
-	var sb strings.Builder
-	for _, token := range tokens {
-		sb.WriteString(C.GoString(C.llama_token_to_str(llm.tokens, C.llama_token(token))))
-	}
-	return sb.String()
-}
-
-func (llm *Model) next(ctx context.Context, options *PredictOptions, keep int) (C.llama_token, error) {
-	llm.mu.Lock()
-	defer llm.mu.Unlock()
-
-	if len(llm.embd) >= llm.NumCtx {
-		numLeft := (llm.NumCtx - keep) / 2
-		truncated := llm.embd[:keep]
-		truncated = append(truncated, llm.embd[len(llm.embd)-numLeft:]...)
-
-		llm.embd = truncated
-		llm.cursor = keep
-	}
-
-	for {
-		if llm.gc {
-			return 0, io.EOF
-		}
-
-		if llm.cursor >= len(llm.embd) {
-			break
-		}
-
-		numEval := len(llm.embd) - llm.cursor
-		if numEval > llm.NumBatch {
-			numEval = llm.NumBatch
-		}
-
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		if retval := C.llama_eval(llm.tokens, unsafe.SliceData(llm.embd[llm.cursor:]), C.int(numEval), C.int(llm.cursor), C.int(llm.NumThread)); retval != 0 {
-			return 0, fmt.Errorf("llama_eval: %d", retval)
-		}
-
-		llm.cursor += numEval
-	}
-
-	// TODO: split SampleOptions from PredictOptions
-	var sampleOpts C.struct_llama_sample_options
-	sampleOpts.repeat_penalty = C.float(options.RepeatPenalty)
-	sampleOpts.frequency_penalty = C.float(options.FrequencyPenalty)
-	sampleOpts.presence_penalty = C.float(options.PresencePenalty)
-	sampleOpts.temperature = C.float(options.Temperature)
-	sampleOpts.top_k = C.int(options.TopK)
-	sampleOpts.top_p = C.float(options.TopP)
-	sampleOpts.tfs_z = C.float(options.TFSZ)
-	sampleOpts.typical_p = C.float(options.TypicalP)
-	sampleOpts.mirostat = C.int(options.Mirostat)
-	sampleOpts.mirostat_tau = C.float(options.MirostatTau)
-	sampleOpts.mirostat_eta = C.float(options.MirostatEta)
-	sampleOpts.penalize_newline = C.bool(options.PenalizeNewline)
-
-	numVocab := C.llama_n_vocab(llm.tokens)
-	logits := unsafe.Slice(C.llama_get_logits(llm.tokens), numVocab)
-
-	// TODO: logit bias
-
-	candidates := make([]C.llama_token_data, numVocab)
-	for i := range logits {
-		candidates[i] = C.llama_token_data{
-			id:    C.int(i),
-			logit: logits[i],
-			p:     0,
-		}
-	}
-
-	repeatLastN := options.RepeatLastN
-	if len(llm.last) < repeatLastN {
-		repeatLastN = len(llm.last)
-	}
-
-	if llm.NumCtx < repeatLastN {
-		repeatLastN = llm.NumCtx
-	}
-
-	lastN := llm.last[len(llm.last)-repeatLastN:]
-
-	token := C.llama_sample(
-		llm.tokens,
-		unsafe.SliceData(candidates), C.size_t(len(candidates)),
-		unsafe.SliceData(lastN), C.size_t(len(lastN)),
-		&sampleOpts,
-	)
-
-	llm.last = append(llm.last, token)
-	llm.embd = append(llm.embd, token)
-
-	if token == C.llama_token_eos() {
-		return 0, io.EOF
-	}
-
-	return token, nil
-}
-
-// Embedding returns the embeddings for the given sequence of encoded tokens.
-func (llm *Model) Embedding(tokens []int) ([]float64, error) {
-	if !llm.EmbeddingOnly {
-		return nil, errors.New("llama: embedding not enabled")
-	}
-
-	cTokens := make([]C.llama_token, len(tokens))
-	for i := range tokens {
-		cTokens[i] = C.llama_token(tokens[i])
-	}
-
-	retval := C.llama_eval(llm.tokens, unsafe.SliceData(cTokens), C.int(len(tokens)), 0, C.int(llm.NumThread))
-	if retval != 0 {
-		return nil, errors.New("llama: eval")
-	}
-
-	n := C.llama_n_embd(llm.tokens)
-	if n <= 0 {
-		return nil, errors.New("llama: no embeddings generated")
-	}
-	cEmbeddings := unsafe.Slice(C.llama_get_embeddings(llm.tokens), n)
-
-	embeddings := make([]float64, len(cEmbeddings))
-	for i, v := range cEmbeddings {
-		embeddings[i] = float64(v)
-	}
-	return embeddings, nil
-}
-
-// Prediction contains the information passed to the callback function by PredictLlama.  The values in here are not
-// valid after the callback returns -- information like Response should be copied out.
+// Predictions are produced in a stream by Predict and passed to a callback.
 type Prediction struct {
-	model *Model
-
-	Model    string `json:"model"`
-	Response []int  `json:"response"`
-	Done     bool   `json:"done"`
+	Output string `json:"output"`
 }
 
-// String implements llm.Prediction by decoding the predicted tokens.  This will be valid UTF-8.
-func (r *Prediction) String() string { return r.model.Decode(r.Response...) }
-
-// Tokens implements llm.Prediction by returning the predicted tokens, which is a series of tokens that decode to
-// valid UTF-8.
-func (r *Prediction) Tokens() []int { return r.Response }
-
-// Context returns the context used to generate the prediction.
-func (r *Prediction) Context() []int {
-	src := r.model.embd
-	embd := make([]int, len(src))
-	for i := range src {
-		embd[i] = int(src[i])
-	}
-	return embd
-}
-
-// Timings may be called to get the timings for the prediction.
-func (r *Prediction) Timings() *PredictionTimings {
-	timings := C.llama_get_timings(r.model.tokens)
-	return &PredictionTimings{
-		SampleCount:        int(timings.n_sample),
-		SampleDuration:     parseDurationMs(float64(timings.t_sample_ms)),
-		PromptEvalCount:    int(timings.n_p_eval),
-		PromptEvalDuration: parseDurationMs(float64(timings.t_p_eval_ms)),
-		EvalCount:          int(timings.n_eval),
-		EvalDuration:       parseDurationMs(float64(timings.t_eval_ms)),
-	}
-}
-
-type PredictionTimings struct {
-	SampleCount        int
-	SampleDuration     time.Duration
-	PromptEvalCount    int
-	PromptEvalDuration time.Duration
-	EvalCount          int
-	EvalDuration       time.Duration
+func (p *Prediction) String() string {
+	return p.Output
 }

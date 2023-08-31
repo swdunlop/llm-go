@@ -5,28 +5,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"os"
 	"sync"
 
 	"github.com/nats-io/nats.go"
 	"github.com/swdunlop/llm-go"
-	"github.com/swdunlop/llm-go/configuration"
 	"github.com/swdunlop/llm-go/internal/slog"
+	client "github.com/swdunlop/llm-go/nats"
 	msg "github.com/swdunlop/llm-go/nats/protocol"
 )
 
 // Run will run a NATS-based worker with the provided NATS connection and configuration.
-func Run(ctx context.Context, cf configuration.Interface, options ...Option) error {
+func Run(ctx context.Context, cf map[string]string, options ...Option) error {
 	slog.From(ctx).Debug(`starting worker`)
 	var w worker
-	w.options = Options{
-		LLMType:       "",
-		NATSUrl:       nats.DefaultURL,
-		WorkerSubject: "llm.worker.default",
-		ClientName:    "llm-worker",
-	}
-	err := configuration.Unmarshal(&w.options, cf)
+	w.options.Options = client.Defaults()
+	w.options.ClientName = `llm-worker`
+	err := llm.Unmap(cf, &w.options)
 	if err != nil {
 		return err
 	}
@@ -45,17 +39,13 @@ func Run(ctx context.Context, cf configuration.Interface, options ...Option) err
 		if err != nil {
 			return err
 		}
-		if p, ok := m.(llm.Predictor); !ok {
-			return fmt.Errorf(`%q does not implement llm.Predictor`, w.options.LLMType)
-		} else {
-			w.model = p
-		}
+		w.model = m
 		defer w.model.Release()
 	}
 
 	if w.conn == nil {
 		var err error
-		w.conn, err = nats.Connect(w.options.NATSUrl, nats.Name(w.options.ClientName))
+		w.conn, err = w.options.Dial() // TODO: error handler
 		if err != nil {
 			return err
 		}
@@ -90,25 +80,17 @@ func Run(ctx context.Context, cf configuration.Interface, options ...Option) err
 // Options describes the configuration options for a NATS-based worker.  Note that this configuration will be passed on
 // to the LLM driver, so the driver may have additional configuration options.
 type Options struct {
-	// LLM implementation to use, this must be specified and must implement llm.Predictor.
-	LLMType string `cfg:"llm_type"`
+	client.Options
 
-	// NATSUrl is the URL of the NATS server to connect to, defaults to nats.DefaultURL.
-	NATSUrl string `cfg:"nats_url"`
-
-	// WorkerSubject is the NATS subject to subscribe to, defaults to llm.worker.default.
-	WorkerSubject string `cfg:"worker_subject"`
-
-	// ClientName gives the client a name that is used to identify it in NATS server logs.  This defaults to
-	// "llm-worker".
-	ClientName string `cfg:"nats_client_name"`
+	// LLM implementation to use.
+	LLMType string `json:"type"`
 }
 
 type worker struct {
 	options Options
-	hooks   []func(ctx context.Context, model llm.Predictor, req *msg.PredictRequest) error
+	hooks   []func(ctx context.Context, model llm.Interface, req *msg.PredictRequest) error
 	conn    *nats.Conn
-	model   llm.Predictor
+	model   llm.Interface
 	job     struct {
 		done    chan struct{}
 		ch      chan predictRequest
@@ -138,8 +120,6 @@ func (w *worker) process(ctx context.Context, nm *nats.Msg) {
 		w.reject(ctx, nm.Reply, ``, msg.ErrInvalidRequest, "job id is required")
 		return
 	}
-
-	os.Stdout.Write(nm.Data)
 
 	ok := false
 	if req.Interrupt != nil {
@@ -242,7 +222,7 @@ func (w *worker) processPredictRequest(ctx context.Context, req predictRequest) 
 		reply = req.Stream
 	}
 
-	output, err := w.model.Predict(ctx, req.Input, callback)
+	output, err := w.model.Predict(ctx, req.Options, req.Input, callback)
 	switch {
 	case err == nil:
 		_ = w.respond(ctx, reply, &msg.WorkerResponse{
@@ -289,7 +269,7 @@ func (w *worker) respond(ctx context.Context, subject string, resp *msg.WorkerRe
 type Option func(*worker)
 
 // Predictor sets the model to use for predictions.
-func Predictor(model llm.Predictor) Option {
+func Predictor(model llm.Interface) Option {
 	return func(w *worker) {
 		if w.model != nil {
 			w.err = errors.New("only one predictor can be used by a worker")
@@ -300,7 +280,7 @@ func Predictor(model llm.Predictor) Option {
 
 // A Hook is a function that is called before a prediction is made, allowing it to alter the request.  This is useful
 // when a worker can do some preprocessing of input data, such as reducing the input length to fit context.
-func Hook(hook func(ctx context.Context, model llm.Predictor, req *msg.PredictRequest) error) Option {
+func Hook(hook func(ctx context.Context, model llm.Interface, req *msg.PredictRequest) error) Option {
 	return func(w *worker) { w.hooks = append(w.hooks, hook) }
 }
 

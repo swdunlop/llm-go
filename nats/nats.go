@@ -12,31 +12,31 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
 	"github.com/swdunlop/llm-go"
-	"github.com/swdunlop/llm-go/configuration"
 	"github.com/swdunlop/llm-go/internal/slog"
 	msg "github.com/swdunlop/llm-go/nats/protocol"
 )
 
 func init() {
-	llm.Register("nats", func(cf configuration.Interface) (llm.Interface, error) {
-		return NewNATS(nil, cf)
+	llm.Register("nats", func(cf map[string]string) (llm.Interface, error) {
+		opts := Defaults()
+		err := llm.Unmap(cf, &opts)
+		if err != nil {
+			return nil, err
+		}
+		return NewNATS(nil, opts)
 	})
 }
 
 // NewNATS creates a new NATS client that supports prediction using the provided NATS connection and configuration.
 // The configuration should specify `nats_worker_subject` to identify the worker that will be used to perform the
 // request, otherwise llm.worker.default will be used.
-func NewNATS(conn *nats.Conn, cf configuration.Interface) (*Client, error) {
+func NewNATS(conn *nats.Conn, cf Options) (*Client, error) {
+	var err error
 	ct := new(Client)
-	ct.options = *ClientDefaults()
-	err := configuration.Unmarshal(&ct.options, cf)
-	if err != nil {
-		return nil, err
-	}
+	ct.options = cf
 	ct.conn = conn
 	if ct.conn == nil {
-		ct.conn, err = nats.Connect(ct.options.URL,
-			nats.Name(ct.options.ClientName),
+		ct.conn, err = ct.options.Dial(
 			nats.ErrorHandler(ct.handleNatsError),
 		)
 		if err != nil {
@@ -47,7 +47,7 @@ func NewNATS(conn *nats.Conn, cf configuration.Interface) (*Client, error) {
 	ct.nuid = nuid.New()
 	ct.stream.done = make(chan struct{})
 	ct.stream.inbox = nats.NewInbox()
-	ct.stream.ch = make(chan *nats.Msg)
+	ct.stream.ch = make(chan *nats.Msg, 16) // give NATS some slack.
 	ct.stream.subscription, err = ct.conn.ChanSubscribe(ct.stream.inbox, ct.stream.ch)
 	if err != nil {
 		if ct.release != nil {
@@ -61,7 +61,7 @@ func NewNATS(conn *nats.Conn, cf configuration.Interface) (*Client, error) {
 }
 
 type Client struct {
-	options ClientOptions
+	options Options
 
 	conn    *nats.Conn
 	cancel  func() // cancels the stream handler.
@@ -90,15 +90,21 @@ func (ct *Client) handleNatsError(conn *nats.Conn, sub *nats.Subscription, err e
 }
 
 // Predict implements the llm.Predictor interface by sending a request to the worker and waiting for a response.
-func (ct *Client) Predict(ctx context.Context, input []string, fn func(llm.Prediction) error) (output string, err error) {
+func (ct *Client) Predict(ctx context.Context, options map[string]string, input []string, fn func(llm.Prediction) error) (output string, err error) {
+	return ct.PredictNATS(ctx, options, input, fn)
+}
+
+// PredictNATS is like the standard predict interface but can convey additional options to the worker.
+func (ct *Client) PredictNATS(ctx context.Context, options map[string]string, input []string, fn func(llm.Prediction) error) (output string, err error) {
 	job := ct.nuid.Next()
 	stream := ""
 	if fn != nil {
 		stream = ct.stream.inbox
 	}
 	req := msg.WorkerRequest{Job: job, Predict: &msg.PredictRequest{
-		Input:  input,
-		Stream: stream,
+		Input:   input,
+		Stream:  stream,
+		Options: options,
 	}}
 	data, err := json.Marshal(&req)
 	if err != nil {
@@ -124,7 +130,7 @@ func (ct *Client) Predict(ctx context.Context, input []string, fn func(llm.Predi
 		return "", fmt.Errorf(`empty response from worker`) // should only happen when streaming.
 	}
 
-	streamCh := make(chan *msg.WorkerResponse)
+	streamCh := make(chan *msg.WorkerResponse, 16) // TODO: why do we need so much buffer?
 	ct.subscribeJob(job, streamCh)
 	defer ct.unsubscribeJob(job, streamCh)
 	for {
@@ -239,26 +245,55 @@ func (ct *Client) Release() {
 	ct.conn = nil
 }
 
-func ClientDefaults() *ClientOptions {
-	return &ClientOptions{
-		URL:           `nats://localhost:4222`,
+// Defaults returns the default options for a NATS client.
+func Defaults() Options {
+	return Options{
+		URL:           nats.DefaultURL,
 		WorkerSubject: `llm.worker.default`,
 		ClientName:    `llm-client`,
 	}
 }
 
-// ClientOptions describes the options used to create a NATS client.  This is unmarshalled from the configuration
+// Options describes the options used to create a NATS client.  This is unmarshalled from the configuration
 // provided to llm.New or NewNATS.
-type ClientOptions struct {
-	// URL specifies the NATS client URL used to connect to the NATS server.  This is used if Conn is nil, which is
-	// the case if `llm.New("nats")` is used to create the client.  This defaults to `nats://localhost:4222`.
-	URL string `cfg:"nats_url"`
-
+type Options struct {
 	// WorkerSubject identifies the NATS subject where requests should be sent.  This defaults to `llm.worker.default`,
 	// which matches the worker's default WorkerSubject.
-	WorkerSubject string `cfg:"nats_worker_subject"`
+	WorkerSubject string `env:"nats_worker_subject"`
 
 	// ClientName gives the client a name that is used to identify it in NATS server logs.  This defaults to
 	// `llm-client`.
-	ClientName string `cfg:"nats_client_name"`
+	ClientName string `env:"nats_client_name"`
+
+	// URL specifies the NATS client URL used to connect to the NATS server.  This is used if Conn is nil, which is
+	// the case if `llm.New("nats")` is used to create the client.  This defaults to `nats://localhost:4222`.
+	URL string `env:"nats_url"`
+
+	// NKeyFile provides the path to an nkey seed / secret file that will be used to authenticate with the NATS server.
+	// Ignored if a NATS connection is provided.
+	NKeyFile string `env:"nats_nk"`
+
+	// CA provides the path to a file containing trusted certificates for verifying the NATS server.  Ignored if a
+	// NATS connection is provided.  If not provided, the host certificate authorities will be used.
+	CA string `env:"nats_ca"`
+}
+
+// Dial will connect to the NATS server using the options provided.
+func (opts *Options) Dial(more ...nats.Option) (*nats.Conn, error) {
+	options := make([]nats.Option, 0, 8)
+	if opts.NKeyFile != `` {
+		opt, err := nats.NkeyOptionFromSeed(opts.NKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		options = append(options, opt)
+	}
+	if opts.CA != `` {
+		options = append(options, nats.RootCAs(opts.CA))
+	}
+	if opts.ClientName != `` {
+		options = append(options, nats.Name(opts.ClientName))
+	}
+	options = append(options, more...)
+	return nats.Connect(opts.URL, options...)
 }
