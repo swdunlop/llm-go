@@ -1,17 +1,27 @@
 // Package msg describes the protocol used between the NATS client and worker.
 package msg
 
+import "github.com/swdunlop/llm-go"
+
 // WorkerRequest is sent to the worker on the worker subject ask it to do something on behalf of the client.  Only one
 // of the pointer fields should be non-nil.
 type WorkerRequest struct {
 	// Job identifies the request, which will be present in responses and can be used to cancel long running requests.
 	Job string `json:"job,omitempty"`
 
+	// List is a request to list the available models.
+	List *ListRequest `json:"list,omitempty"`
+
 	// Predict is a request to predict the next token.
 	Predict *PredictRequest `json:"predict,omitempty"`
 
 	// Interrupt is a request to interrupt a long running request.
 	Interrupt *InterruptRequest `json:"interrupt,omitempty"`
+}
+
+// ListRequest is sent to the worker on the worker subject to request a list of available models.
+type ListRequest struct {
+	// intentionally left blank.
 }
 
 // InterruptRequest is sent to the worker on the worker subject to request an interruption.
@@ -36,7 +46,7 @@ type PredictRequest struct {
 	Stream string `json:"stream,omitempty"`
 
 	// Options provides additional options used by the worker to perform the prediction.  This may be omitted or nil.
-	Options map[string]string `json:"options,omitempty"`
+	Options map[string]any `json:"options,omitempty"`
 }
 
 // WorkerResponse is sent from the worker on the worker subject to reply to a WorkerRequest.  Only one of the pointer
@@ -44,6 +54,9 @@ type PredictRequest struct {
 type WorkerResponse struct {
 	// Job matches the job id from the WorkerRequest.
 	Job string `json:"job,omitempty"`
+
+	// List is a response to a ListRequest.
+	List *ListResponse `json:"list,omitempty"`
 
 	// Predict is a response to a PredictRequest.
 	Predict *PredictResponse `json:"predict,omitempty"`
@@ -56,6 +69,33 @@ type WorkerResponse struct {
 
 	// Error is a response to any request that failed.
 	Error *Error `json:"error,omitempty"`
+}
+
+// ListResponse is sent as a reply to ListRequest to show information about the worker and its models.
+type ListResponse struct {
+	// Models contains the list of available models.
+	Models []ModelInfo `json:"models,omitempty"`
+}
+
+// ModelInfo contains information about a model.
+type ModelInfo struct {
+	// Model is the name of the model, as used by PredictRequest.
+	Model string `json:"model,omitempty"`
+
+	// Options contains the list of settings that can be used to configure the model and their defaults.
+	Options []llm.Option `json:"options,omitempty"`
+}
+
+// OptionInfo contains information about a model option.
+type OptionInfo struct {
+	// Name is the name of the option.
+	Name string `json:"name,omitempty"`
+
+	// Default is the default value for the option.
+	Default string `json:"default,omitempty"`
+
+	// Description is a human readable description of the option.
+	Description string `json:"description,omitempty"`
 }
 
 // StreamResponse is optionally sent if the Stream subject is provided in a PredictRequest.
@@ -104,4 +144,5 @@ const (
 	ErrPredictionFailed          // prediction failed
 	ErrInterrupted               // request was interrupted
 	ErrHookFailed                // a request hook failed
+	ErrInvalidModel              // the model could not be loaded
 )

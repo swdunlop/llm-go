@@ -14,11 +14,11 @@
           ] else [ ]);
     in {
       devShells.default = pkgs.stdenv.mkDerivation {
-        name = "ollama-build";
+        name = "llm-go-build";
         inherit buildInputs;
       };
       devShells.worker = pkgs.stdenv.mkDerivation {
-        name = "ollama-worker";
+        name = "llm-go-worker";
         buildInputs = with pkgs; buildInputs ++ [ nats-server natscli ];
       };
     }

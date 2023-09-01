@@ -2,9 +2,13 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/nats-io/nats.go"
@@ -15,11 +19,13 @@ import (
 )
 
 // Run will run a NATS-based worker with the provided NATS connection and configuration.
-func Run(ctx context.Context, cf map[string]string, options ...Option) error {
+func Run(ctx context.Context, cf map[string]any, options ...Option) error {
 	slog.From(ctx).Debug(`starting worker`)
 	var w worker
+	w.cf = cf
 	w.options.Options = client.Defaults()
 	w.options.ClientName = `llm-worker`
+	w.options.Dir = `.`
 	err := llm.Unmap(cf, &w.options)
 	if err != nil {
 		return err
@@ -31,16 +37,13 @@ func Run(ctx context.Context, cf map[string]string, options ...Option) error {
 		}
 	}
 
-	if w.model == nil {
-		if w.options.LLMType == "" {
-			return errors.New(`llm type must be specified`)
-		}
-		m, err := llm.New(w.options.LLMType, cf)
-		if err != nil {
-			return err
-		}
-		w.model = m
-		defer w.model.Release()
+	if w.options.LLMType == "" {
+		return errors.New(`llm_type must be specified`)
+	}
+
+	w.driverOptions = llm.Settings(w.options.LLMType)
+	if w.driverOptions == nil {
+		return errors.New(`llm_type not found`)
 	}
 
 	if w.conn == nil {
@@ -51,6 +54,12 @@ func Run(ctx context.Context, cf map[string]string, options ...Option) error {
 		}
 		defer w.conn.Close()
 	}
+
+	defer func() {
+		if w.model.release != nil {
+			w.model.release()
+		}
+	}()
 
 	ch := make(chan *nats.Msg)
 	slog.From(ctx).Debug(`subscribing to worker subject`, `subject`, w.options.WorkerSubject)
@@ -84,19 +93,28 @@ type Options struct {
 
 	// LLM implementation to use.
 	LLMType string `json:"type"`
+
+	// Dir provides the directory where models are stored, defaults to "."
+	Dir string `json:"dir,omitempty"`
 }
 
 type worker struct {
-	options Options
-	hooks   []func(ctx context.Context, model llm.Interface, req *msg.PredictRequest) error
-	conn    *nats.Conn
-	model   llm.Interface
-	job     struct {
+	cf            map[string]any
+	options       Options
+	driverOptions []llm.Option
+	hooks         []func(ctx context.Context, model llm.Interface, req *msg.PredictRequest) error
+	conn          *nats.Conn
+	job           struct {
 		done    chan struct{}
 		ch      chan predictRequest
 		control sync.RWMutex
 		id      string
 		cancel  func() // cancels a prediction
+	}
+	model struct {
+		hash    []byte // last configuration used to create the model.
+		llm     llm.Interface
+		release func()
 	}
 	err error // used by hooks to indicate a fatal error.
 }
@@ -122,6 +140,10 @@ func (w *worker) process(ctx context.Context, nm *nats.Msg) {
 	}
 
 	ok := false
+	if req.List != nil {
+		w.list(ctx, nm.Reply, req.Job)
+		ok = true
+	}
 	if req.Interrupt != nil {
 		w.interrupt(ctx, nm.Reply, req.Job)
 		ok = true
@@ -154,6 +176,37 @@ func (w *worker) predict(ctx context.Context, reply, job string, req *msg.Predic
 	}
 }
 
+func (w *worker) list(ctx context.Context, reply, job string) {
+	options := w.driverOptions
+	entries, err := os.ReadDir(w.options.Dir)
+	if err != nil {
+		w.reject(ctx, reply, job, msg.ErrUnknown, err.Error())
+		return
+	}
+	models := make([]msg.ModelInfo, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if len(name) < 1 || name[0] == '.' || !strings.HasSuffix(name, `.bin`) {
+			continue
+		}
+		// NOTE: we do not currently have a way to get options from a model, all we have are the options from the driver.
+		// After GGUF, we may.
+		models = append(models, msg.ModelInfo{
+			Model:   name,
+			Options: options,
+		})
+	}
+	_ = w.respond(ctx, reply, &msg.WorkerResponse{
+		Job: job,
+		List: &msg.ListResponse{
+			Models: models,
+		},
+	})
+}
+
 func (w *worker) interrupt(ctx context.Context, reply, job string) {
 	w.job.control.Lock()
 	defer w.job.control.Unlock()
@@ -182,8 +235,15 @@ func (w *worker) processPredictRequest(ctx context.Context, req predictRequest) 
 	w.job.control.Unlock()
 	close(req.ok)
 
+	err := w.loadModel(ctx, req.Options)
+	if err != nil {
+		// TODO: detect if the model is not found and return a different error.
+		w.reject(ctx, req.reply, req.job, msg.ErrInvalidModel, err.Error())
+		return
+	}
+
 	for _, hook := range w.hooks {
-		err := hook(ctx, w.model, req.PredictRequest)
+		err := hook(ctx, w.model.llm, req.PredictRequest)
 		switch err := err.(type) {
 		case nil:
 			// do nothing
@@ -222,7 +282,7 @@ func (w *worker) processPredictRequest(ctx context.Context, req predictRequest) 
 		reply = req.Stream
 	}
 
-	output, err := w.model.Predict(ctx, req.Options, req.Input, callback)
+	output, err := w.model.llm.Predict(ctx, req.Options, req.Input, callback)
 	switch {
 	case err == nil:
 		_ = w.respond(ctx, reply, &msg.WorkerResponse{
@@ -234,6 +294,53 @@ func (w *worker) processPredictRequest(ctx context.Context, req predictRequest) 
 	default:
 		w.reject(ctx, reply, req.job, msg.ErrPredictionFailed, err.Error())
 	}
+}
+
+func (w *worker) loadModel(ctx context.Context, cf map[string]any) error {
+	h := fnv.New128a()
+	enc := json.NewEncoder(h)
+	c2 := make(map[string]any, len(w.cf))
+	for _, option := range w.driverOptions {
+		if !option.Init {
+			continue
+		}
+		value := option.Value
+		if str, ok := cf[option.Name]; ok {
+			value = str
+		} else if str, ok := w.cf[option.Name]; ok {
+			value = str
+		}
+		c2[option.Name] = value
+		enc.Encode(option.Name)
+		enc.Encode(value)
+	}
+	hash := h.Sum(nil)
+	cf = c2
+
+	if w.model.llm != nil && bytes.Equal(hash, w.model.hash) {
+		return nil // already loaded.
+	}
+
+	for name, value := range w.cf {
+		if _, ok := cf[name]; !ok {
+			cf[name] = value
+		}
+	}
+
+	if model, ok := cf[`model`].(string); ok {
+		if strings.IndexAny(model, `/\`) >= 0 {
+			return errors.New(`model name cannot contain path separators`)
+		}
+	}
+
+	m, err := llm.New(w.options.LLMType, cf)
+	if err != nil {
+		return err
+	}
+	w.model.llm = m
+	w.model.release = m.Release
+	w.model.hash = hash
+	return nil
 }
 
 type predictRequest struct {
@@ -267,16 +374,6 @@ func (w *worker) respond(ctx context.Context, subject string, resp *msg.WorkerRe
 
 // An Option is a function that alters a worker's behavior.
 type Option func(*worker)
-
-// Predictor sets the model to use for predictions.
-func Predictor(model llm.Interface) Option {
-	return func(w *worker) {
-		if w.model != nil {
-			w.err = errors.New("only one predictor can be used by a worker")
-		}
-		w.model = model
-	}
-}
 
 // A Hook is a function that is called before a prediction is made, allowing it to alter the request.  This is useful
 // when a worker can do some preprocessing of input data, such as reducing the input length to fit context.

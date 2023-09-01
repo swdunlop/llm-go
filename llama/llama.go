@@ -100,25 +100,24 @@ import (
 )
 
 func init() {
-	llm.Register(`llama`, func(cf map[string]string) (llm.Interface, error) {
+	llm.Register(`llama`, func(cf map[string]any) (llm.Interface, error) {
 		var model = struct {
 			Model string `json:"model"`
 			// TODO: Adapters
-			NumCtx int `json:"num_ctx"`
-			Seed   int `json:"seed"`
+			NumCtx int `json:"ctx_size"`
 		}{
-			NumCtx: 512,
+			NumCtx: 4096,
 		}
 		err := llm.Unmap(cf, &model)
 		if err != nil {
 			return nil, err
 		}
-		predict := PredictDefaults()
+		predict := predictDefaults
 		err = llm.Unmap(cf, &predict)
 		if err != nil {
 			return nil, err
 		}
-		err = llm.Unmap(cf, &predict.SampleOptions)
+		err = llm.Unmap(cf, &predict)
 		if err != nil {
 			return nil, err
 		}
@@ -130,10 +129,9 @@ func init() {
 			MLock(true),                    // TODO: make this configurable
 			MMap(true),                     // TODO: make this configurable
 			NThreads(runtime.NumCPU() - 2), // TODO: make this configurable
-			Seed(uint32(model.Seed)),       // TODO: support uint32 in unmarshal
 		}
 		return New(options...)
-	})
+	}, llmOptions...)
 }
 
 func New(options ...Option) (Interface, error) {
@@ -155,10 +153,6 @@ func New(options ...Option) (Interface, error) {
 type Interface interface {
 	llm.Interface
 
-	// PredictLlama predicts a stream of output until the model returns an EOS token, the context is cancelled or
-	// a stop token is encountered.
-	PredictLlama(ctx context.Context, content []string, options ...PredictOption) (string, error)
-
 	// ContextSize returns the number of tokens in the model context.
 	ContextSize() int
 
@@ -167,18 +161,6 @@ type Interface interface {
 
 	// Decode detokenizes the given tokens using the model.
 	Decode(tokens ...Token) (string, error)
-
-	// Eval evaluates the given tokens using the model.
-	Eval(tokens []Token, nPast int) error
-
-	// Sample determines the next token using the model.
-	Sample(options ...SampleOption) (Token, error)
-
-	// PredictOptions returns the base predict options for the model.
-	PredictOptions() PredictOptions
-
-	// SampleOptions returns the base sample options for the model.
-	SampleOptions() SampleOptions
 
 	// BOS returns the Beginning of Stream token for the model.
 	BOS() Token
@@ -215,14 +197,11 @@ func MLock(ok bool) Option { return modelOption(func(p *modelParams) { p.use_mlo
 // MMap maps the model file into memory instead of reading it, which may improve load speed.
 func MMap(ok bool) Option { return modelOption(func(p *modelParams) { p.use_mmap = C.bool(ok) }) }
 
-// Seed specifies the random seed to use for sampling, default is 0, which generates a new random seed at startup.
-func Seed(seed uint32) Option { return func(l *llama) { l.seed = seed } }
-
 // Temperature specifies the sampling temperature, default is 1.0.  Higher temperatures generate more random samples,
 // lower temperatures generate more deterministic samples.  If temperature is 0 or lower, greedy sampling is used
 // instead, with the most probable token always being selected.
-func Temperature(t float32) SampleOption {
-	return func(opts *SampleOptions) { opts.Temperature = t }
+func Temperature(t float32) PredictOption {
+	return func(opts *predictOptions) { opts.Temperature = t }
 }
 
 func modelOption(fn func(p *modelParams)) Option {
@@ -241,9 +220,8 @@ type llama struct {
 	initialized    bool
 	modelParams    modelParams
 	modelFile      string
-	seed           uint32
 	nThreads       int
-	predictOptions PredictOptions
+	predictOptions predictOptions
 	err            error
 
 	model *C.struct_llama_model
@@ -263,7 +241,8 @@ func (cfg *llama) init() error {
 		return fmt.Errorf("failed to create context from model %q", cfg.modelFile)
 	}
 	boot := []Token{cfg.BOS()}
-	return cfg.Eval(boot, 0)
+	cfg.seed(42)
+	return cfg.eval(boot, 0)
 }
 
 // Encode tokenizes the given text using the model.
@@ -297,14 +276,14 @@ func (cfg *llama) Decode(tokens ...Token) (string, error) {
 }
 
 // Predict implements the llm.Predictor interface.
-func (cfg *llama) Predict(ctx context.Context, cf map[string]string, content []string, fn func(llm.Prediction) error) (string, error) {
+func (cfg *llama) Predict(ctx context.Context, cf map[string]any, content []string, fn func(llm.Prediction) error) (string, error) {
 	return cfg.PredictLlama(ctx, content,
 		PredictConfiguration(cf),
 		Callback(func(p *Prediction) error { return fn(p) }),
 	)
 }
 
-// Predict returns the most likely tokens for the given context.
+// PredictLlama returns the most likely tokens for the given context.
 func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ...PredictOption) (out string, err error) {
 	opts := cfg.predictOptions
 	for _, opt := range options {
@@ -338,6 +317,8 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 		out = buf.String()
 	}()
 
+	cfg.seed(opts.Seed)
+
 	eos := cfg.EOS()
 	for {
 		var text string
@@ -346,7 +327,7 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 		}
 		// text, _ := cfg.Decode(tokens...)
 		// fmt.Printf("predicting %q past %v\n", text, past)
-		err = cfg.Eval(tokens, past)
+		err = cfg.eval(tokens, past)
 		if err != nil {
 			return
 		}
@@ -385,6 +366,13 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 	}
 }
 
+func (cfg *llama) seed(u uint32) {
+	if u == 0 {
+		u = rand.Uint32()
+	}
+	C.llama_set_rng_seed(cfg.llama, C.uint32_t(u))
+}
+
 func (cfg *llama) inputTokens(inputs []string) ([][]Token, error) {
 	ret := make([][]Token, len(inputs))
 	for i, input := range inputs {
@@ -397,16 +385,11 @@ func (cfg *llama) inputTokens(inputs []string) ([][]Token, error) {
 	return ret, nil
 }
 
-// Eval evaluates the given batch of tokens using the model.
-func (cfg *llama) Eval(batch []Token, nPast int) error {
+// eval evaluates the given batch of tokens using the model.
+func (cfg *llama) eval(batch []Token, nPast int) error {
 	if nPast >= int(cfg.modelParams.n_ctx) {
 		return fmt.Errorf(`%w %v`, errPastOverflow{}, cfg.modelParams.n_ctx)
 	}
-	seed := cfg.seed
-	if seed < 1 {
-		seed = rand.Uint32()
-	}
-	C.llama_set_rng_seed(cfg.llama, C.uint32_t(seed))
 	C.llama_reset_timings(cfg.llama)
 	// TODO: if nPast exceeds the context size, we must reset.
 	res := C.llama_eval(cfg.llama, unsafe.SliceData(batch), C.int(len(batch)), C.int(nPast), C.int(cfg.nThreads))
@@ -422,14 +405,15 @@ func (errPastOverflow) Error() string { return `past overflows context limit` }
 
 // Sample selects the most likely token from the model after Eval.  The recent slice is used by the "recent" options
 // to penalize tokens that have recently been selected.
-func (cfg *llama) Sample(options ...SampleOption) (Token, error) {
-	opts := cfg.predictOptions.SampleOptions
+func (cfg *llama) Sample(options ...PredictOption) (Token, error) {
+	opts := cfg.predictOptions
 	for _, opt := range options {
 		opt(&opts)
 		if opts.err != nil {
 			return 0, opts.err
 		}
 	}
+	cfg.seed(opts.Seed)
 	var params sampleParams
 	opts.setParams(&params)
 	return cfg.sample(&params, opts.recent)
@@ -464,11 +448,8 @@ func (cfg *llama) sample(params *sampleParams, recent []Token) (Token, error) {
 	)), nil
 }
 
-// PredictOptions are options for Predict.
-func (cfg *llama) PredictOptions() PredictOptions { return cfg.predictOptions }
-
-// SampleOptions are options for Sample.
-func (cfg *llama) SampleOptions() SampleOptions { return cfg.predictOptions.SampleOptions }
+// PredictOptions are options for Predict and Sample.
+func (cfg *llama) PredictOptions() predictOptions { return cfg.predictOptions }
 
 // BOS returns the Beginning of Stream token for the model.
 func (cfg *llama) BOS() Token { return llamaBOS }
@@ -542,12 +523,12 @@ func compact(max int, instructions []Token, contents [][]Token) []Token {
 type Token = C.int32_t
 
 // Sample adds sampling options that modify every call to Sample.
-func Sample(options ...SampleOption) Option {
+func Sample(options ...PredictOption) Option {
 	return func(cfg *llama) {
 		for _, option := range options {
-			option(&cfg.predictOptions.SampleOptions)
-			if cfg.predictOptions.SampleOptions.err != nil {
-				cfg.err = cfg.predictOptions.SampleOptions.err
+			option(&cfg.predictOptions)
+			if cfg.predictOptions.err != nil {
+				cfg.err = cfg.predictOptions.err
 				return
 			}
 		}
@@ -569,56 +550,29 @@ func Predict(options ...PredictOption) Option {
 
 // Stop replaces the set of stop tokens used by Predict.
 func Stop(stop ...string) PredictOption {
-	return func(opts *PredictOptions) {
+	return func(opts *predictOptions) {
 		opts.Stop = stop
 	}
 }
 
-func PredictConfiguration(cf map[string]string) PredictOption {
-	return func(opts *PredictOptions) {
+func PredictConfiguration(cf map[string]any) PredictOption {
+	return func(opts *predictOptions) {
 		opts.err = llm.Unmap(cf, opts)
 	}
 }
 
 // Callback sets a callback that will be called every time predict outputs tokens that cannot involve a stop token.
 func Callback(fn func(*Prediction) error) PredictOption {
-	return func(opts *PredictOptions) {
+	return func(opts *predictOptions) {
 		opts.callback = fn
 	}
 }
 
 // A PredictOption modifies the behavior of Predict.
-type PredictOption func(*PredictOptions)
+type PredictOption func(*predictOptions)
 
-// PredictOptions controls the behavior of Predict.
-type PredictOptions struct {
-	SampleOptions // options that modify every call to Sample, which is a part of Prediction.
-
-	// Instruction is a string that will always be in context when predicting.  This is typically used for things like
-	// instructions to the model that should always be present.
-	//
-	// The more instructions you have, the less of the context will be used for recent input, so use this sparingly.
-	Instructions string `json:"instructions"`
-
-	// Stop is a list of strings that, if they occur in the output, will cause prediction to stop and they will be
-	// omitted from the output.  This is typically used for things like reverse prompts.
-	Stop []string `json:"stop"`
-
-	callback func(*Prediction) error
-}
-
-// Recent provides Sample with a slice of recent tokens for penalizing recently selected tokens.
-func Recent(tokens []Token) func(*SampleOptions) {
-	return func(opts *SampleOptions) {
-		opts.recent = tokens
-	}
-}
-
-// A SampleOption modifies the behavior of Sample.
-type SampleOption func(*SampleOptions)
-
-// SampleOptions controls sampling used to choose a token.
-type SampleOptions struct {
+// predictOptions controls the behavior of Predict.
+type predictOptions struct {
 	RepeatPenalty    float32 `json:"repeat_penalty"`
 	FrequencyPenalty float32 `json:"frequency_penalty"`
 	PresencePenalty  float32 `json:"presence_penalty"`
@@ -631,40 +585,71 @@ type SampleOptions struct {
 	MirostatTau      float32 `json:"mirostat_tau"`
 	MirostatEta      float32 `json:"mirostat_eta"`
 	PenalizeNewline  bool    `json:"penalize_newline"`
+	Seed             uint32  `json:"seed"` // Used to seed both predict and sample.
 
-	recent []Token `json:"-"`
-	err    error   `json:"-"`
+	// Instruction is a string that will always be in context when predicting.  This is typically used for things like
+	// instructions to the model that should always be present.
+	//
+	// The more instructions you have, the less of the context will be used for recent input, so use this sparingly.
+	Instructions string `json:"instructions"`
+
+	// Stop is a list of strings that, if they occur in the output, will cause prediction to stop and they will be
+	// omitted from the output.  This is typically used for things like reverse prompts.
+	Stop []string `json:"stop"`
+
+	callback func(*Prediction) error
+	recent   []Token `json:"-"`
+	err      error   `json:"-"`
 }
 
-// PredictDefaults provides a set of default prediction options.
-func PredictDefaults() PredictOptions {
-	return PredictOptions{
-		SampleOptions: SampleDefaults(),
-		Instructions:  "",
-		Stop:          nil,
-		callback:      nil,
+// Recent provides Sample with a slice of recent tokens for penalizing recently selected tokens.
+func Recent(tokens []Token) func(*predictOptions) {
+	return func(opts *predictOptions) {
+		opts.recent = tokens
 	}
 }
 
-// SampleDefaults provides a set of default sampling options.
-func SampleDefaults() SampleOptions {
-	return SampleOptions{
-		RepeatPenalty:    1.1,
-		FrequencyPenalty: 0.0,
-		PresencePenalty:  0.0,
-		Temperature:      0.8,
-		TopK:             40,
-		TopP:             0.9,
-		TFSZ:             1.0,
-		TypicalP:         1.0,
-		Mirostat:         0,
-		MirostatTau:      5.0,
-		MirostatEta:      0.1,
-		PenalizeNewline:  true,
-	}
+var llmOptions = []llm.Option{
+	// Model Options
+	{Name: `model`, Value: ``, Use: `Model file name.`, Init: true},
+	{Name: `ctx_size`, Value: 4096, Use: `Number of tokens in the model context.`, Init: true},
+	// ngl, mg, ts, lv, mlock, nmap, numa are controlled by the package and not options.
+	// TODO: lora
+
+	// Sample / Predict Options
+	{Name: `repeat_penalty`, Value: 1.1, Use: `Adjust the repetition penalty. 1.0 means no penalty. 1.2 means +20% chance of repeating. 0.8 means -20% chance of repeating.`},
+	{Name: `temperature`, Value: 0.8, Use: `Adjust the randomness of the generated text.`},
+	{Name: `top_k`, Value: 40, Use: `Limit the next token selection to the K most probable tokens.`},
+	{Name: `top_p`, Value: 0.9, Use: `Limit the next token selection to a subset of tokens with a cumulative probability above a threshold P.`},
+	{Name: `tfs_z`, Value: 1.0, Use: `Adjust the tail free sampling parameter.`},
+	{Name: `typical_p`, Value: 1.0, Use: `Adjust the typicality sampling parameter.`},
+	{Name: `mirostat`, Value: 0, Use: `Enable mirostat sampling; 0 = off, 1 = mirostat, 2 = mirostat v2.`},
+	{Name: `mirostat_tau`, Value: 5.0, Use: `Set the Mirostat target entropy, parameter tau.  Higher values mean more random samples. Ignored if mirostat = 0.`},
+	{Name: `mirostat_eta`, Value: 0.1, Use: `Set the Mirostat learning rate, parameter eta.  Higher values mean faster learning. Ignored if mirostat = 0.`},
+	{Name: `penalize_newline`, Value: true, Use: `Penalize newline tokens in sampling.`},
+
+	{Name: `seed`, Value: 0, Use: `Sets the random seed used in sampling.  0 means generate a new seed each time.`},
 }
 
-func (opts *SampleOptions) setParams(ref *C.struct_llama_sample_params) {
+var predictDefaults = predictOptions{
+	Instructions:     "",
+	Stop:             nil,
+	callback:         nil,
+	RepeatPenalty:    1.1,
+	FrequencyPenalty: 0.0,
+	PresencePenalty:  0.0,
+	Temperature:      0.8,
+	TopK:             40,
+	TopP:             0.9,
+	TFSZ:             1.0,
+	TypicalP:         1.0,
+	Mirostat:         0,
+	MirostatTau:      5.0,
+	MirostatEta:      0.1,
+	PenalizeNewline:  true,
+}
+
+func (opts *predictOptions) setParams(ref *C.struct_llama_sample_params) {
 	ref.repeat_penalty = C.float(opts.RepeatPenalty)
 	ref.frequency_penalty = C.float(opts.FrequencyPenalty)
 	ref.presence_penalty = C.float(opts.PresencePenalty)

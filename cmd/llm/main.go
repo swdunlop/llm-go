@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/chzyer/readline"
+	"github.com/mitchellh/go-wordwrap"
 	"github.com/swdunlop/llm-go"
 	"github.com/swdunlop/llm-go/internal/slog"
 	_ "github.com/swdunlop/llm-go/llama"
@@ -100,49 +103,80 @@ func outputPrediction(ctx context.Context, w io.Writer, m llm.Interface, input s
 }
 
 func newLLM(ctx context.Context) (llm.Interface, error) {
-	var driver string
 	driver, ok := cf[`type`]
 	if !ok {
 		return nil, fmt.Errorf(`you must specify an llm_type or leave it unset`)
 	}
-	return llm.New(driver, cf)
+	return llm.New(fmt.Sprint(driver), cf)
 }
 
 func printSettings(ctx context.Context) error {
-	items := make([]string, 0, len(cf))
-	for item := range cf {
-		items = append(items, item)
+	options := make(map[string]llm.Option, 256)
+	names := make([]string, 0, 256)
+
+	options[`type`] = llm.Option{
+		Name:  `type`,
+		Value: defaultType,
+		Use:   `The type of LLM to use, such as "nats" or "llama."`,
 	}
-	sort.Strings(items)
-	for _, item := range items {
-		values := cf[item]
-		fmt.Printf("llm_%s=%v\n", item, values)
+	names = append(names, `type`)
+
+	for _, driver := range []string{`nats`, `llama`} {
+		driverOptions := llm.Settings(driver)
+		for _, opt := range driverOptions {
+			if _, dup := options[opt.Name]; !dup {
+				names = append(names, opt.Name)
+			}
+			options[opt.Name] = opt
+		}
+	}
+
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer tw.Flush()
+	for _, name := range names {
+		option := options[name]
+		value := os.Getenv(`llm_` + name)
+		var val, def []byte
+		var err error
+		if option.Value != nil {
+			def, err = json.Marshal(option.Value)
+			if err != nil {
+				panic(err)
+			}
+		}
+		if value != "" {
+			val, err = json.Marshal(value)
+			if err != nil {
+				panic(err)
+			}
+		}
+		switch {
+		case val != nil && def != nil && !bytes.Equal(val, def):
+			option.Use += fmt.Sprintf(" (current: %s, default: %s)", val, def)
+		case val != nil:
+			option.Use += fmt.Sprintf(" (current: %s)", val)
+		case def != nil:
+			option.Use += fmt.Sprintf(" (default: %s)", def)
+		}
+		option.Use = strings.ReplaceAll(wordwrap.WrapString(option.Use, 60), "\n", "\n\t")
+		if strings.ContainsAny(option.Use, "\n") {
+			option.Use += "\n\t"
+		}
+		fmt.Fprintf(tw, "llm_%s\t%s\n", name, option.Use)
 	}
 	return nil
 }
 
 var cf = envConfig()
 
-func envConfig() map[string]string {
-	cfg := map[string]string{
-		`type`:  defaultType,
-		`model`: defaultModel,
+func envConfig() map[string]any {
+	cf := llm.Env(`llm_`)
+	if _, ok := cf[`type`]; !ok {
+		cf[`type`] = defaultType
 	}
-	for _, env := range os.Environ() {
-		if !strings.HasPrefix(env, `llm_`) {
-			continue
-		}
-		env = strings.TrimPrefix(env, `llm_`)
-		parts := strings.SplitN(env, `=`, 2)
-		if len(parts) != 2 {
-			continue
-		}
-		cfg[parts[0]] = parts[1]
-	}
-	return cfg
+	return cf
 }
 
 const (
-	defaultType  = `llama`
-	defaultModel = `vicuna-7b-v1.5.ggmlv3.q5_K_M.bin`
+	defaultType = `llama`
 )

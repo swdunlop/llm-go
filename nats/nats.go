@@ -17,14 +17,14 @@ import (
 )
 
 func init() {
-	llm.Register("nats", func(cf map[string]string) (llm.Interface, error) {
+	llm.Register("nats", func(cf map[string]any) (llm.Interface, error) {
 		opts := Defaults()
 		err := llm.Unmap(cf, &opts)
 		if err != nil {
 			return nil, err
 		}
 		return NewNATS(nil, opts)
-	})
+	}, llmOptions...)
 }
 
 // NewNATS creates a new NATS client that supports prediction using the provided NATS connection and configuration.
@@ -90,12 +90,12 @@ func (ct *Client) handleNatsError(conn *nats.Conn, sub *nats.Subscription, err e
 }
 
 // Predict implements the llm.Predictor interface by sending a request to the worker and waiting for a response.
-func (ct *Client) Predict(ctx context.Context, options map[string]string, input []string, fn func(llm.Prediction) error) (output string, err error) {
+func (ct *Client) Predict(ctx context.Context, options map[string]any, input []string, fn func(llm.Prediction) error) (output string, err error) {
 	return ct.PredictNATS(ctx, options, input, fn)
 }
 
 // PredictNATS is like the standard predict interface but can convey additional options to the worker.
-func (ct *Client) PredictNATS(ctx context.Context, options map[string]string, input []string, fn func(llm.Prediction) error) (output string, err error) {
+func (ct *Client) PredictNATS(ctx context.Context, options map[string]any, input []string, fn func(llm.Prediction) error) (output string, err error) {
 	job := ct.nuid.Next()
 	stream := ""
 	if fn != nil {
@@ -254,28 +254,36 @@ func Defaults() Options {
 	}
 }
 
+var llmOptions = []llm.Option{
+	{Name: `nats_worker_subject`, Value: `llm.worker.default`, Use: `The NATS subject where requests should be sent.`},
+	{Name: `nats_client_name`, Value: `llm-client`, Use: `The name of the client, used to identify it in NATS server logs.`},
+	{Name: `nats_url`, Value: nats.DefaultURL, Use: `The NATS client URL used to connect to the NATS server.`},
+	{Name: `nats_nk`, Use: `The path to an nkey seed / secret file that will be used to authenticate with the NATS server.`},
+	{Name: `nats_ca`, Use: `The path to a file containing trusted certificates for verifying the NATS server.`},
+}
+
 // Options describes the options used to create a NATS client.  This is unmarshalled from the configuration
 // provided to llm.New or NewNATS.
 type Options struct {
 	// WorkerSubject identifies the NATS subject where requests should be sent.  This defaults to `llm.worker.default`,
 	// which matches the worker's default WorkerSubject.
-	WorkerSubject string `env:"nats_worker_subject"`
+	WorkerSubject string `json:"nats_worker_subject"`
 
 	// ClientName gives the client a name that is used to identify it in NATS server logs.  This defaults to
 	// `llm-client`.
-	ClientName string `env:"nats_client_name"`
+	ClientName string `json:"nats_client_name"`
 
 	// URL specifies the NATS client URL used to connect to the NATS server.  This is used if Conn is nil, which is
 	// the case if `llm.New("nats")` is used to create the client.  This defaults to `nats://localhost:4222`.
-	URL string `env:"nats_url"`
+	URL string `json:"nats_url"`
 
 	// NKeyFile provides the path to an nkey seed / secret file that will be used to authenticate with the NATS server.
 	// Ignored if a NATS connection is provided.
-	NKeyFile string `env:"nats_nk"`
+	NKeyFile string `json:"nats_nk"`
 
 	// CA provides the path to a file containing trusted certificates for verifying the NATS server.  Ignored if a
 	// NATS connection is provided.  If not provided, the host certificate authorities will be used.
-	CA string `env:"nats_ca"`
+	CA string `json:"nats_ca"`
 }
 
 // Dial will connect to the NATS server using the options provided.
