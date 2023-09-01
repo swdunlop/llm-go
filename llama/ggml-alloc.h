@@ -1,5 +1,5 @@
 /**
- * llama.cpp - git dadbed99e65252d79f81101a392d0d6497b86caa
+ * llama.cpp - git 744f4916b35f5a12f200e7fd4bc6a3a3ecf43c0d
  *
  * MIT License
  *
@@ -38,7 +38,7 @@ GGML_API struct ggml_allocr * ggml_allocr_new_measure(size_t alignment);
 
 // tell the allocator to parse nodes following the order described in the list
 // you should call this if your graph are optimized to execute out-of-order
-GGML_API void   ggml_allocr_set_parse_seq(struct ggml_allocr * alloc, int * list, int n);
+GGML_API void   ggml_allocr_set_parse_seq(struct ggml_allocr * alloc, const int * list, int n);
 
 GGML_API void   ggml_allocr_free(struct ggml_allocr * alloc);
 GGML_API bool   ggml_allocr_is_measure(struct ggml_allocr * alloc);

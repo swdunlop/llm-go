@@ -39,7 +39,7 @@ llama_token llama_sample(
 	};
 
 	if (n_last_tokens > 0) {
-		struct llama_token_data newline = candidates_p.data[llama_token_nl()];
+		struct llama_token_data newline = candidates_p.data[llama_token_nl(ctx)];
 
 		llama_sample_repetition_penalty(
 			ctx, &candidates_p,
@@ -52,7 +52,7 @@ llama_token llama_sample(
 			opts->frequency_penalty, opts->presence_penalty);
 
 		if (!opts->penalize_newline) {
-			candidates_p.data[llama_token_nl()] = newline;
+			candidates_p.data[llama_token_nl(ctx)] = newline;
 		}
 	}
 
@@ -261,17 +261,20 @@ func (cfg *llama) Encode(text string) ([]Token, error) {
 
 // Decode detokenizes the given tokens using the model.
 func (cfg *llama) Decode(tokens ...Token) (string, error) {
+	// TODO: This is a pointless memcpy, we may want to just look things up in the vocab directly.
 	var buf strings.Builder
+	var tmp [1024]byte // TODO: what is the right size?
 	buf.Grow(len(tokens) * 4)
 	// TODO: is this lock necessary?
 	for _, token := range tokens {
-		// TODO: what is the difference between llama_token_to_str and llama_token_to_piece ?
-		cstr := C.llama_token_to_str(cfg.llama, token)
-		if cstr == nil {
-			return buf.String(), fmt.Errorf(`llama_token_to_str %v failed`, token)
+		n := C.llama_token_to_piece(cfg.llama, token, (*C.char)(unsafe.Pointer(&tmp[0])), C.int(len(tmp)))
+		if n < 0 {
+			return buf.String(), fmt.Errorf(`llama_token_to_piece %v failed`, token)
 		}
-		buf.WriteString(C.GoString(cstr))
+		buf.Write(tmp[:n])
 	}
+	str := buf.String()
+	str = strings.TrimPrefix(str, ` `) // there is generally a leading space due to tokenization.
 	return buf.String(), nil
 }
 
@@ -452,15 +455,10 @@ func (cfg *llama) sample(params *sampleParams, recent []Token) (Token, error) {
 func (cfg *llama) PredictOptions() predictOptions { return cfg.predictOptions }
 
 // BOS returns the Beginning of Stream token for the model.
-func (cfg *llama) BOS() Token { return llamaBOS }
+func (cfg *llama) BOS() Token { return C.llama_token_bos(cfg.llama) }
 
 // EOS returns the End of Stream token for the model.
-func (cfg *llama) EOS() Token { return llamaEOS }
-
-var (
-	llamaBOS = C.llama_token_bos()
-	llamaEOS = C.llama_token_eos()
-)
+func (cfg *llama) EOS() Token { return C.llama_token_eos(cfg.llama) }
 
 func (cfg *llama) Release() {
 	if cfg.llama != nil {

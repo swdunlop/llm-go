@@ -9,3 +9,4 @@ ollama
 *.bin
 bin
 etc
+*.gguf

@@ -56,6 +56,5 @@ func Unmap(in map[string]any, ref any) error {
 	if err != nil {
 		return err
 	}
-	os.Stderr.Write(js)
 	return json.Unmarshal(js, ref)
 }

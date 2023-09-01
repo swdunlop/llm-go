@@ -1,5 +1,5 @@
 /**
- * llama.cpp - git dadbed99e65252d79f81101a392d0d6497b86caa
+ * llama.cpp - git 744f4916b35f5a12f200e7fd4bc6a3a3ecf43c0d
  *
  * MIT License
  *
@@ -28,6 +28,14 @@
 
 #include "ggml.h"
 
+#ifdef GGML_USE_HIPBLAS
+#define GGML_CUDA_NAME "ROCm"
+#define GGML_CUBLAS_NAME "hipBLAS"
+#else
+#define GGML_CUDA_NAME "CUDA"
+#define GGML_CUBLAS_NAME "cuBLAS"
+#endif
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -42,9 +50,14 @@ GGML_API bool   ggml_cuda_can_mul_mat(const struct ggml_tensor * src0, const str
 GGML_API void   ggml_cuda_set_tensor_split(const float * tensor_split);
 GGML_API void   ggml_cuda_transform_tensor(void * data, struct ggml_tensor * tensor);
 GGML_API void   ggml_cuda_free_data(struct ggml_tensor * tensor);
+
 GGML_API void   ggml_cuda_assign_buffers(struct ggml_tensor * tensor);
 GGML_API void   ggml_cuda_assign_buffers_no_scratch(struct ggml_tensor * tensor);
 GGML_API void   ggml_cuda_assign_buffers_force_inplace(struct ggml_tensor * tensor);
+
+GGML_API void   ggml_cuda_assign_buffers_no_alloc(struct ggml_tensor * tensor);
+GGML_API void   ggml_cuda_assign_scratch_offset(struct ggml_tensor * tensor, size_t offset);
+
 GGML_API void   ggml_cuda_set_main_device(int main_device);
 GGML_API void   ggml_cuda_set_mul_mat_q(bool mul_mat_q);
 GGML_API void   ggml_cuda_set_scratch_size(size_t scratch_size);
