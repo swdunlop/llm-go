@@ -8,6 +8,7 @@ package llama
 #cgo darwin,arm64 CPPFLAGS: -DGGML_USE_METAL -DGGML_METAL_NDEBUG
 #cgo darwin LDFLAGS: -framework Accelerate -framework Foundation -framework Metal -framework MetalKit -framework MetalPerformanceShaders
 #include <stdlib.h>
+#include "ggml-alloc.h"
 #include "llama.h"
 
 struct llama_sample_params
@@ -329,7 +330,7 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 			return
 		}
 		// text, _ := cfg.Decode(tokens...)
-		// fmt.Printf("predicting %q past %v\n", text, past)
+		// fmt.Printf("predicting %v tokens, past %v, n_ctx %v\n", len(tokens), past, cfg.modelParams.n_ctx)
 		err = cfg.eval(tokens, past)
 		if err != nil {
 			return
@@ -390,14 +391,23 @@ func (cfg *llama) inputTokens(inputs []string) ([][]Token, error) {
 
 // eval evaluates the given batch of tokens using the model.
 func (cfg *llama) eval(batch []Token, nPast int) error {
-	if nPast >= int(cfg.modelParams.n_ctx) {
+	if nPast+len(batch) >= int(cfg.modelParams.n_ctx) {
 		return fmt.Errorf(`%w %v`, errPastOverflow{}, cfg.modelParams.n_ctx)
 	}
 	C.llama_reset_timings(cfg.llama)
-	// TODO: if nPast exceeds the context size, we must reset.
-	res := C.llama_eval(cfg.llama, unsafe.SliceData(batch), C.int(len(batch)), C.int(nPast), C.int(cfg.nThreads))
-	if res != 0 {
-		return errors.New("llama_eval failed")
+	// if we give more than 1024 tokens to eval in one go, we encounter buffer allocation issues in llama.cpp
+	// as of 2023-09-01.  This was not true before GGUF.
+	for len(batch) > 0 {
+		f := 1024
+		if f > len(batch) {
+			f = len(batch)
+		}
+		res := C.llama_eval(cfg.llama, unsafe.SliceData(batch), C.int(f), C.int(nPast), C.int(cfg.nThreads))
+		if res != 0 {
+			return errors.New("llama_eval failed")
+		}
+		batch = batch[f:]
+		nPast += f
 	}
 	return nil
 }
