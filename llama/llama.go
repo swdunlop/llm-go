@@ -225,8 +225,9 @@ type llama struct {
 	predictOptions predictOptions
 	err            error
 
-	model *C.struct_llama_model
-	llama *C.struct_llama_context
+	model   *C.struct_llama_model
+	llama   *C.struct_llama_context
+	history []Token
 }
 
 type sampleParams = C.struct_llama_sample_params
@@ -281,6 +282,7 @@ func (cfg *llama) Decode(tokens ...Token) (string, error) {
 
 // Predict implements the llm.Predictor interface.
 func (cfg *llama) Predict(ctx context.Context, cf map[string]any, content []string, fn func(llm.Prediction) error) (string, error) {
+	// json.NewEncoder(os.Stderr).Encode(cf) // println
 	return cfg.PredictLlama(ctx, content,
 		PredictConfiguration(cf),
 		Callback(func(p *Prediction) error { return fn(p) }),
@@ -303,16 +305,30 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 	if err != nil {
 		return ``, err
 	}
+	filter := internal.NewStopFilter(opts.Stop...)
 	keep := len(instructions)
-	max := (int(cfg.modelParams.n_ctx) - keep) * 3 / 4 // 75% of non-instruction context is available for content.
+	max := (int(cfg.modelParams.n_ctx) - keep) * 2 / 3 // 66% of non-instruction context is available for content.
 
 	contentTokens, err := cfg.inputTokens(content)
+	if err != nil {
+		return ``, err
+	}
+
+	cfg.seed(opts.Seed)
+
+reset:
 	tokens := compact(max, instructions, contentTokens)
 	if tokens == nil {
 		return ``, fmt.Errorf(`content and instructions overflow context size %v`, cfg.modelParams.n_ctx)
 	}
-	filter := internal.NewStopFilter(opts.Stop...)
-	past := 0
+
+	past := cfg.pastBatch(tokens)
+	history := make([]Token, past, cfg.modelParams.n_ctx)
+	copy(history, cfg.history) // TODO: this does not handle a reset well.
+	defer func() {
+		// println("resulting history", len(history))
+		cfg.history = history
+	}()
 
 	var buf strings.Builder
 	buf.Grow(16384)
@@ -320,8 +336,6 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 		buf.WriteString(filter.String())
 		out = buf.String()
 	}()
-
-	cfg.seed(opts.Seed)
 
 	eos := cfg.EOS()
 	for {
@@ -332,9 +346,17 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 		// text, _ := cfg.Decode(tokens...)
 		// fmt.Printf("predicting %v tokens, past %v, n_ctx %v\n", len(tokens), past, cfg.modelParams.n_ctx)
 		err = cfg.eval(tokens, past)
+		if errors.Is(err, errPastOverflow{}) {
+			// fmt.Printf("%v tokens, past overflow, resetting\n", len(tokens))
+			cfg.history = history
+			contentTokens = append(contentTokens, tokens)
+			goto reset
+		}
 		if err != nil {
 			return
 		}
+
+		history = append(history, tokens...)
 		past += len(tokens)
 		var token Token
 		token, err = cfg.sample(&params, nil) // TODO: provide rest.
@@ -344,8 +366,7 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 		if token == eos {
 			return
 		}
-		tokens[0] = token
-		tokens = tokens[:1]
+		tokens = []Token{token}
 		// var text string
 		text, err = cfg.Decode(token)
 		if err != nil {
@@ -370,6 +391,19 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 	}
 }
 
+// pastBatch compares the batch to the history to determine the nPast
+func (cfg *llama) pastBatch(batch []Token) int {
+	if len(batch) > len(cfg.history) {
+		batch = batch[:len(cfg.history)]
+	}
+	for i, t := range batch {
+		if cfg.history[i] != t {
+			return i
+		}
+	}
+	return len(batch)
+}
+
 func (cfg *llama) seed(u uint32) {
 	if u == 0 {
 		u = rand.Uint32()
@@ -389,16 +423,17 @@ func (cfg *llama) inputTokens(inputs []string) ([][]Token, error) {
 	return ret, nil
 }
 
-// eval evaluates the given batch of tokens using the model.
+// eval evaluates the given input, calculating npast using history.
 func (cfg *llama) eval(batch []Token, nPast int) error {
 	if nPast+len(batch) >= int(cfg.modelParams.n_ctx) {
 		return fmt.Errorf(`%w %v`, errPastOverflow{}, cfg.modelParams.n_ctx)
 	}
+	// fmt.Fprintf(os.Stderr, "evaluating %v tokens, nPast %v\n", len(batch), nPast)
 	C.llama_reset_timings(cfg.llama)
-	// if we give more than 1024 tokens to eval in one go, we encounter buffer allocation issues in llama.cpp
+	// if we give more than 256 tokens to eval in one go, we encounter buffer allocation issues in llama.cpp
 	// as of 2023-09-01.  This was not true before GGUF.
 	for len(batch) > 0 {
-		f := 1024
+		f := 256
 		if f > len(batch) {
 			f = len(batch)
 		}

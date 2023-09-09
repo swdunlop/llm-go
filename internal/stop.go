@@ -1,6 +1,8 @@
 package internal
 
-import "bytes"
+import (
+	"bytes"
+)
 
 // NewStopFilter constructs a stop filter with the provided set of case sensitive stop strings.
 func NewStopFilter(stops ...string) *StopFilter {
