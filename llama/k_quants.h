@@ -1,5 +1,5 @@
 /**
- * llama.cpp - git 744f4916b35f5a12f200e7fd4bc6a3a3ecf43c0d
+ * llama.cpp - git 21ac3a1503001020122db5dce6adf34b761675f5
  *
  * MIT License
  *
