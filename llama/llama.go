@@ -316,6 +316,13 @@ func (cfg *llama) PredictLlama(ctx context.Context, content []string, options ..
 
 	cfg.seed(opts.Seed)
 
+	var buf strings.Builder
+	buf.Grow(16384)
+	defer func() {
+		buf.WriteString(filter.String())
+		out = buf.String()
+	}()
+
 reset:
 	tokens := compact(max, instructions, contentTokens)
 	if tokens == nil {
@@ -328,13 +335,6 @@ reset:
 	defer func() {
 		// println("resulting history", len(history))
 		cfg.history = history
-	}()
-
-	var buf strings.Builder
-	buf.Grow(16384)
-	defer func() {
-		buf.WriteString(filter.String())
-		out = buf.String()
 	}()
 
 	eos := cfg.EOS()
