@@ -1,0 +1,45 @@
+--- /tmp/ggml-metal.m.orig	2023-10-15 09:28:07.671036000 -0700
++++ internal/llama/ggml-metal.m	2023-10-15 09:33:27.096260205 -0700
+@@ -10,6 +10,8 @@
+ 
+ #import <Metal/Metal.h>
+ 
++extern NSString * __nonnull const ggml_metal_src; // from ggml-metal-metal.m
++
+ #undef MIN
+ #undef MAX
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+@@ -198,29 +200,13 @@
+         bundle = [NSBundle bundleForClass:[GGMLMetalClass class]];
+ #endif
+         NSError * error = nil;
+-        NSString * libPath = [bundle pathForResource:@"default" ofType:@"metallib"];
+-        if (libPath != nil) {
+-            NSURL * libURL = [NSURL fileURLWithPath:libPath];
+-            GGML_METAL_LOG_INFO("%s: loading '%s'\n", __func__, [libPath UTF8String]);
+-            ctx->library = [ctx->device newLibraryWithURL:libURL error:&error];
+-        } else {
+-            GGML_METAL_LOG_INFO("%s: default.metallib not found, loading from source\n", __func__);
+ 
+-            NSString * sourcePath = [bundle pathForResource:@"ggml-metal" ofType:@"metal"];
+-            GGML_METAL_LOG_INFO("%s: loading '%s'\n", __func__, [sourcePath UTF8String]);
+-            NSString * src = [NSString stringWithContentsOfFile:sourcePath encoding:NSUTF8StringEncoding error:&error];
+-            if (error) {
+-                GGML_METAL_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+-                return NULL;
+-            }
+-
+-            MTLCompileOptions* options = nil;
++        MTLCompileOptions* options = nil;
+ #ifdef GGML_QKK_64
+-            options = [MTLCompileOptions new];
+-            options.preprocessorMacros = @{ @"QK_K" : @(64) };
++        options = [MTLCompileOptions new];
++        options.preprocessorMacros = @{ @"QK_K" : @(64) };
+ #endif
+-            ctx->library = [ctx->device newLibraryWithSource:src options:options error:&error];
+-        }
++        ctx->library = [ctx->device newLibraryWithSource:ggml_metal_src options:options error:&error];
+ 
+         if (error) {
+             GGML_METAL_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);

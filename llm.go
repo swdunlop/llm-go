@@ -1,88 +1,124 @@
-// Package llm describes a high level interface to large language models suitable for basic prediction tasks.
 package llm
 
 import (
-	"context"
-	"fmt"
+	"github.com/rs/zerolog"
+	"github.com/swdunlop/llm-go/internal/llama"
+	"github.com/swdunlop/llm-go/predict"
 )
 
-// Register will register a named LLM implementation.
-func Register(name string, fn func(map[string]any) (Interface, error), settings ...Option) {
-	_, dup := implementations[name]
-	if dup {
-		panic(fmt.Errorf(`%w, %q`, errDuplicateImplementation{}, name))
+// New loads an LLM model using the provided options from a language model stored at the given path.  A single model
+// can be used to generate multiple prediction streams concurrently.
+func New(modelPath string, options ...Option) (Model, error) {
+	var cfg config
+	var err error
+	cfg.logger = zerolog.Nop()
+	cfg.llama, err = llama.Load(modelPath)
+	if err != nil {
+		return nil, err
 	}
-	implementations[name] = implementation{fn, settings}
-}
-
-// Settings returns a list of settings that can be used to configure an LLM implementation.
-func Settings(name string) []Option {
-	imp, ok := implementations[name]
-	if !ok {
-		return nil
+	cfg.parameters = llama.Defaults()
+	for _, option := range options {
+		option(&cfg)
 	}
-	return imp.settings
-}
-
-// A Option describes a setting that can be used to configure an LLM implementation.
-type Option struct {
-	// Name is the name of this setting.  This is used as the key in the settings map passed to the LLM implementation.
-	Name string `json:"name"` // The name of this setting.
-
-	// Value is the value of this setting.  This is either the default value or the current value, depending on the
-	// context.
-	Value any `json:"value"`
-
-	// Use describes the purpose of this setting.
-	Use string `json:"use"`
-
-	// Init identifies options that are only applicable when creating a new  instance and not when using its methods.
-	Init bool `json:"init,omitempty"`
-}
-
-// errDuplicateImplementation is returned when an implementation is registered with a name that is already in use.
-type errDuplicateImplementation struct{}
-
-// Error implements the error interface by returning a static string, "duplicate implementation"
-func (errDuplicateImplementation) Error() string { return "duplicate implementation" }
-
-// New uses the named implementation to create a new LLM instance.
-func New(implementation string, settings map[string]any) (Interface, error) {
-	imp, ok := implementations[implementation]
-	if !ok {
-		return nil, fmt.Errorf(`%w, %q`, errUnknownImplementation{}, implementation)
+	if cfg.err != nil {
+		cfg.llama.Close()
+		return nil, cfg.err
 	}
-	return imp.fn(settings)
+	return &cfg, nil
 }
 
-// implementations maps implementation names to their factory functions.
-var implementations = map[string]implementation{}
-
-type implementation struct {
-	fn       func(map[string]any) (Interface, error)
-	settings []Option
+// Zerolog specifies a logger to use for the model and its predictions.  If not specified,  the default logger will be
+// used.
+func Zerolog(logger zerolog.Logger) Option {
+	return func(cfg *config) {
+		cfg.logger = logger
+	}
 }
 
-// errUnknownImplementation is returned when an unknown implementation is requested.
-type errUnknownImplementation struct{}
+type Model interface {
+	// Close releases any resources held by the language model.  This should not be called while a stream has not been
+	// closed.
+	Close()
 
-// Error implements the error interface by returning a static string, "unknown implementation"
-func (errUnknownImplementation) Error() string { return "unknown implementation" }
+	// Encode converts a string into a sequence of tokens that can be used to predict the next token in the sequence.
+	Encode(string) []Token
 
-// Interface describes the common interface that large language models supported by this package provide.
-type Interface interface {
-	Release() // Closes the model and releases any associated resources.
+	// Decode converts a sequence of tokens into a string.
+	Decode([]Token) string
 
-	// Predict calls the provided function with the language model's predicted continuation of the provided input
-	// string.  Prediction will stop if the function returns an error, and will eventually stop after the provided
-	// context is cancelled.
-	Predict(
-		ctx context.Context, settings map[string]any, content []string, fn func(Prediction) error,
-	) (string, error)
+	// Predict returns a prediction stream that can be used to generate text.
+	Predict(tokens []Token, options ...predict.Option) (Stream, error)
+
+	// Load loads the current state of the language model from a file.
+	// Load(path string) error
 }
 
-// A Prediction provides a partial prediction of the input continuation from a Predictor.
-type Prediction interface {
-	// String will return the predicted continuation as a string.
-	String() string
+// A Stream is a prediction stream from a language model that can be used to generate text.
+type Stream interface {
+	Close()
+
+	// Pos returns the current position in the stream.
+	// Pos() int
+
+	// Reset resets the prediction stream to a previous position; this will panic if the position is less than zero or
+	// greater than the current position.
+	// Reset(pos int)
+
+	// Next optionally inputs more tokens into the prediction stream and then returns the next token in the stream.
+	// Next will return io.EOF if the model indicated the end of the stream (EOS).
+	// Next may indicate Overload if the model is overloaded and cannot accept more tokens and must instead be
+	// reset.
+	Next(tokens []Token) (Token, error)
+
+	// Save saves the current state of the prediction stream to a file.
+	// Save(path string) error
 }
+
+// Predict applies a set of prediction options to the model to establish defaults.
+func Predict(options ...predict.Option) Option {
+	return func(cfg *config) {
+		cfg.parameters, cfg.err = predict.Parameters(&cfg.parameters, options...)
+	}
+}
+
+// An Option affects the configuration of a language model.
+type Option func(*config)
+
+type config struct {
+	llama      llama.Model
+	parameters llama.Parameters
+	logger     zerolog.Logger
+	err        error
+}
+
+func (cfg *config) Close() { cfg.llama.Close() }
+
+func (cfg *config) Encode(text string) []Token   { return cfg.llama.Encode(text) }
+func (cfg *config) Decode(tokens []Token) string { return cfg.llama.Decode(tokens) }
+
+func (cfg *config) Predict(tokens []Token, options ...predict.Option) (Stream, error) {
+	var stream stream
+	var err error
+	var parameters = llama.Defaults() // TODO: allow parameters to be altered.
+	stream.llama, err = cfg.llama.Predict(&cfg.logger, &parameters, tokens)
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
+}
+
+type stream struct{ llama llama.Stream }
+
+func (st stream) Close() { st.llama.Close() }
+func (st stream) Next(tokens []Token) (Token, error) {
+	return st.llama.Next(tokens)
+}
+
+// A Token expresses part of the text in a language model.  Tokens may be specific to their model or family of models.
+type Token = llama.Token
+
+// Overload is returned by Predict and Next when the number of tokens in the stream exceeds the model's capacity.
+type Overload struct{}
+
+// Error implements the Go error interface by simply stating "model overload" as the error message.
+func (Overload) Error() string { return `model overload` }

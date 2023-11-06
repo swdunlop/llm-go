@@ -1,182 +1,130 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
-	"text/tabwriter"
 
-	"github.com/chzyer/readline"
-	"github.com/mitchellh/go-wordwrap"
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
+	"github.com/rs/zerolog/pkgerrors"
 	"github.com/swdunlop/llm-go"
-	"github.com/swdunlop/llm-go/internal/slog"
-	_ "github.com/swdunlop/llm-go/llama"
-	_ "github.com/swdunlop/llm-go/nats"
-	"github.com/swdunlop/llm-go/nats/worker"
 	"github.com/swdunlop/zugzug-go"
+	"github.com/swdunlop/zugzug-go/zug/parser"
 )
 
-var tasks = zugzug.Tasks{
-	{Name: "worker", Use: "runs a NATS worker with the specified LLM type and model", Fn: runWorker},
-	{Name: "client", Use: "runs the specified LLM type and model in interactive mode", Fn: runClient},
-	{Name: "predict", Use: "reads stdin and predicts a continuation to stdout", Fn: predictOutput},
-	{Name: "settings", Use: "prints the current settings combining the defaults and configuration", Fn: printSettings},
-}
-
 func init() {
-	slog.Init(os.Stderr)
+	zlog.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr}).
+		With().Timestamp().Logger()
+	zerolog.DefaultContextLogger = &zlog.Logger
+	zerolog.ErrorStackMarshaler = pkgerrors.MarshalStack
+
+	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: `2006-01-02 15:04:05`}).With().Timestamp().Logger()
+	zerolog.DefaultContextLogger = &log
+	zlog.Logger = log
 }
 
 func main() {
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].Name < tasks[j].Name })
 	zugzug.Main(tasks)
 }
 
-func predictOutput(ctx context.Context) error {
-	m, err := newLLM(ctx)
-	if err != nil {
-		return err
+var (
+	cfgModel       string
+	cfgModelOption = parser.String(&cfgModel, `model`, `m`, `model to use`)
+	tasks          = zugzug.Tasks{
+		{Name: `predict`, Fn: runPredict, Use: `runs a prediction`, Parser: parser.New(
+			cfgModelOption,
+		)},
+		{Name: `encode`, Fn: runEncode, Use: `encodes text as tokens`, Parser: parser.New(
+			cfgModelOption,
+		)},
+		{Name: `decode`, Fn: runDecode, Use: `decodes tokens as text`, Parser: parser.New(
+			cfgModelOption,
+		)},
 	}
-	defer m.Release()
+)
 
-	input, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return err
-	}
-	return outputPrediction(ctx, os.Stdout, m, string(input))
-}
+func runEncode(ctx context.Context) error {
+	return withModel(func(m llm.Model) error {
+		m, err := llm.New(cfgModel)
 
-func runWorker(ctx context.Context) error {
-	return worker.Run(ctx, cf)
-}
-
-func runClient(ctx context.Context) error {
-	m, err := newLLM(ctx)
-	if err != nil {
-		return err
-	}
-	defer m.Release()
-
-	rl, err := readline.New(`> `)
-	if err != nil {
-		return err
-	}
-	defer rl.Close()
-	stdout := rl.Stdout()
-
-	for {
-		line, err := rl.Readline()
+		tokens := m.Encode(strings.Join(parser.Args(ctx), ` `))
+		if len(tokens) == 0 {
+			return nil
+		}
+		_, err = fmt.Fprintf(os.Stdout, `%d`, tokens[0])
 		if err != nil {
 			return err
 		}
-		err = outputPrediction(ctx, stdout, m, line)
-		if err != nil {
-			return err
+		for _, token := range tokens[1:] {
+			_, err = fmt.Fprintf(os.Stdout, ` %d`, token)
+			if err != nil {
+				return err
+			}
 		}
-	}
-}
-
-func outputPrediction(ctx context.Context, w io.Writer, m llm.Interface, input string) error {
-	predicted := 0
-	output, err := m.Predict(ctx, cf, strings.Split(input, "\n"), func(prediction llm.Prediction) error {
-		output := prediction.String()
-		predicted += len(output)
-		_, err := w.Write([]byte(output))
-		os.Stdout.Sync() // TODO
+		_, err = fmt.Fprintln(os.Stdout)
 		return err
 	})
+}
+
+func runDecode(ctx context.Context) error {
+	args := parser.Args(ctx)
+	tokens := make([]llm.Token, len(args))
+	for i, arg := range args {
+		v, err := strconv.Atoi(arg)
+		if err != nil {
+			return err
+		}
+		tokens[i] = llm.Token(v)
+	}
+	return withModel(func(m llm.Model) error {
+		_, err := os.Stdout.WriteString(m.Decode(tokens))
+		return err
+	})
+}
+
+func runPredict(ctx context.Context) error {
+	return withModel(func(m llm.Model) error {
+		tokens := m.Encode(strings.Join(parser.Args(ctx), ` `))
+		s, err := m.Predict(tokens)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		for {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			t, err := s.Next(nil)
+			switch err {
+			case nil:
+				_, err = os.Stdout.WriteString(m.Decode([]llm.Token{t}))
+				if err != nil {
+					return err
+				}
+				_ = os.Stdout.Sync()
+			case io.EOF:
+				return nil
+			case llm.Overload{}:
+				return fmt.Errorf(`prediction exceeds model capacity`)
+			default:
+				return err
+			}
+		}
+	})
+}
+
+func withModel(process func(llm.Model) error) error {
+	m, err := llm.New(cfgModel)
 	if err != nil {
 		return err
 	}
-	// not all LLMs support incremental prediction, so we check to see if there is unprinted output and
-	// print it.
-	if len(output) > predicted {
-		_, _ = w.Write([]byte(output[predicted:]))
-	}
-	if !strings.HasSuffix(output, "\n") {
-		_, err = w.Write([]byte("\n"))
-	}
-	return err
-}
-
-func newLLM(ctx context.Context) (llm.Interface, error) {
-	driver, ok := cf[`type`]
-	if !ok {
-		return nil, fmt.Errorf(`you must specify an llm_type or leave it unset`)
-	}
-	return llm.New(fmt.Sprint(driver), cf)
-}
-
-func printSettings(ctx context.Context) error {
-	options := make(map[string]llm.Option, 256)
-	names := make([]string, 0, 256)
-
-	options[`type`] = llm.Option{
-		Name:  `type`,
-		Value: defaultType,
-		Use:   `The type of LLM to use, such as "nats" or "llama."`,
-	}
-	names = append(names, `type`)
-
-	for _, driver := range []string{`nats`, `llama`} {
-		driverOptions := llm.Settings(driver)
-		for _, opt := range driverOptions {
-			if _, dup := options[opt.Name]; !dup {
-				names = append(names, opt.Name)
-			}
-			options[opt.Name] = opt
-		}
-	}
-
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	defer tw.Flush()
-	for _, name := range names {
-		option := options[name]
-		value := os.Getenv(`llm_` + name)
-		var val, def []byte
-		var err error
-		if option.Value != nil {
-			def, err = json.Marshal(option.Value)
-			if err != nil {
-				panic(err)
-			}
-		}
-		if value != "" {
-			val, err = json.Marshal(value)
-			if err != nil {
-				panic(err)
-			}
-		}
-		switch {
-		case val != nil && def != nil && !bytes.Equal(val, def):
-			option.Use += fmt.Sprintf(" (current: %s, default: %s)", val, def)
-		case val != nil:
-			option.Use += fmt.Sprintf(" (current: %s)", val)
-		case def != nil:
-			option.Use += fmt.Sprintf(" (default: %s)", def)
-		}
-		option.Use = strings.ReplaceAll(wordwrap.WrapString(option.Use, 60), "\n", "\n\t")
-		if strings.ContainsAny(option.Use, "\n") {
-			option.Use += "\n\t"
-		}
-		fmt.Fprintf(tw, "llm_%s\t%s\n", name, option.Use)
-	}
+	defer m.Close()
+	process(m)
 	return nil
 }
-
-var cf = envConfig()
-
-func envConfig() map[string]any {
-	cf := llm.Env(`llm_`)
-	if _, ok := cf[`type`]; !ok {
-		cf[`type`] = defaultType
-	}
-	return cf
-}
-
-const (
-	defaultType = `llama`
-)
