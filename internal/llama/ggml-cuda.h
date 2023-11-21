@@ -1,6 +1,6 @@
 // llama.cpp Copyright Georgi Gerganov, 2023, see LICENSE for usage.
-// Fetched from https://github.com/ggerganov/llama.cpp/archive/11bff290458f12f020b588792707f76ec658a27a.tar.gz
-// Commit 11bff290458f12f020b588792707f76ec658a27a
+// Fetched from https://github.com/ggerganov/llama.cpp/archive/0b871f1a04ef60e114bbe43004fd9c21114e802d.tar.gz
+// Commit 0b871f1a04ef60e114bbe43004fd9c21114e802d
 #pragma once
 
 #include "ggml.h"
@@ -20,7 +20,12 @@ extern "C" {
 
 #define GGML_CUDA_MAX_DEVICES       16
 
+// Always success. To check if CUDA is actually loaded, use `ggml_cublas_loaded`.
 GGML_API void   ggml_init_cublas(void);
+
+// Returns `true` if there are available CUDA devices and cublas loads successfully; otherwise, it returns `false`.
+GGML_API bool   ggml_cublas_loaded(void);
+
 GGML_API void * ggml_cuda_host_malloc(size_t size);
 GGML_API void   ggml_cuda_host_free(void * ptr);
 

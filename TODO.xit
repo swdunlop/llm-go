@@ -5,12 +5,13 @@ Implement a basic web API for the model.
 [x] Add "stop" regex array to "GET /v0/predict" API
 [x] Add "cmd/llm/api.hurl" to test and demonstrate the APIs.
 [x] Suppress INFO level logging from Llama to stderr.
+[x] Bump to 0b871f1a04ef60e114bbe43004fd9c21114e802d to see if it fixes llama_batch issues
 [ ] #BUG Correct usage of llama_batch to once per eval.
 [ ] #BUG Repeated service requests with the same input only results in output for the first request.
 [ ] Add "llm get prediction" client for the "GET /predict" API.
-[ ] Add "GET /v0/models" API
-[ ] Add "POST /v0/encode" API 
-[ ] Add "POST /v0/decode" API
+[x] Add "GET /v0/models" API
+[x] Add "POST /v0/encode" API 
+[x] Add "POST /v0/decode" API
 
 Implement a basic web UI for the model.
 [ ] Assemble prosemirror into a text editor with a "predict" action.
@@ -26,3 +27,8 @@ Implement a "guided" variant of the "GET /v0/predict" API
 [ ] Add a GBNF parameter to the "POST /v0/predict" API
 [ ] Add a GBNF parameter to the "GET /v0/predict" API
 [ ] Add a "guide" parameter to the "GET /v0/predict" API, if true, will wait for guidance after each event.
+
+Miscellany / Unsorted
+[ ] Add an Export and Import method for exporting and importing the state of a stream for on-disk retention.
+[ ] Clear the cache if a slot cannot be found by llama_decode.
+[ ] Provide an `llm.Lora` option for models.

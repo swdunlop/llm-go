@@ -12,8 +12,7 @@ package llama
 #include "ggml-alloc.h"
 #include "llama.h"
 
-struct llama_sample_params
-{
+struct llm_go_params {
 	float repeat_penalty;
 	float frequency_penalty;
 	float presence_penalty;
@@ -28,15 +27,15 @@ struct llama_sample_params
 	bool penalize_newline;
 };
 
-int llama_context_eval(struct llama_context *ctx, int pos, llama_token *tokens, int n_tokens) {
+int llm_go_eval(struct llama_context *ctx, int pos, llama_token *tokens, int n_tokens) {
 	if (n_tokens < 1) return 0;
-	llama_batch batch = llama_batch_init(n_tokens, 0);
+	llama_batch batch = llama_batch_init(n_tokens, 0, 1);
 	batch.n_tokens = n_tokens;
 	for (int i = 0; i < n_tokens; i++) {
 		batch.token[i] = tokens[i];
 		batch.pos[i] = pos + i;
-		batch.seq_id[i] = 0;
-		batch.logits[i] = false;
+		batch.seq_id[i][0] = 0;
+		batch.n_seq_id[i] = 1;
 	}
 	batch.logits[n_tokens - 1] = true;
 	int e = llama_decode(ctx, batch);
@@ -44,9 +43,9 @@ int llama_context_eval(struct llama_context *ctx, int pos, llama_token *tokens, 
 	return e;
 }
 
-llama_token llama_sample(
+llama_token llm_go_sample(
 	struct llama_context *ctx,
-	struct llama_sample_params *opts,
+	struct llm_go_params *params,
 	int pos,
 	llama_token *last_tokens, int n_last_tokens
 ) {
@@ -66,50 +65,49 @@ llama_token llama_sample(
 	}
 	llama_token_data_array candidates = {data, n_vocab, false};
 
+	const struct llama_model *model = llama_get_model(ctx);
+
 	if (n_last_tokens > 0) {
-		llama_sample_repetition_penalty(
+		llama_sample_repetition_penalties(
 			ctx, &candidates,
 			last_tokens, n_last_tokens,
-			opts->repeat_penalty
+			params->repeat_penalty,
+			params->frequency_penalty,
+			params->presence_penalty
 		);
 
-		llama_sample_frequency_and_presence_penalties(
-			ctx, &candidates,
-			last_tokens, n_last_tokens,
-			opts->frequency_penalty, opts->presence_penalty
-		);
-
-		if (!opts->penalize_newline) {
-			struct llama_token_data newline = data[llama_token_nl(ctx)];
-			data[llama_token_nl(ctx)] = newline;
+		if (!params->penalize_newline) {
+			llama_token nl = llama_token_nl(model);
+			struct llama_token_data newline = data[nl];
+			data[nl] = newline;
 		}
 	}
 
 	llama_token token = 0;
 
-	if (opts->temperature <= 0) {
+	if (params->temperature <= 0) {
 		token = llama_sample_token_greedy(ctx, &candidates);
-	} else if (opts->mirostat == 1) {
+	} else if (params->mirostat == 1) {
 		int mirostat_m = 100;
-		float mirostat_mu = 2.0f * opts->mirostat_tau;
-		llama_sample_temp(ctx, &candidates, opts->temperature);
+		float mirostat_mu = 2.0f * params->mirostat_tau;
+		llama_sample_temp(ctx, &candidates, params->temperature);
 		token = llama_sample_token_mirostat(
 			ctx, &candidates,
-			opts->mirostat_tau, opts->mirostat_eta,
+			params->mirostat_tau, params->mirostat_eta,
 			mirostat_m, &mirostat_mu);
-	} else if (opts->mirostat == 2) {
-		float mirostat_mu = 2.0f * opts->mirostat_tau;
-		llama_sample_temp(ctx, &candidates, opts->temperature);
+	} else if (params->mirostat == 2) {
+		float mirostat_mu = 2.0f * params->mirostat_tau;
+		llama_sample_temp(ctx, &candidates, params->temperature);
 		token = llama_sample_token_mirostat_v2(
 			ctx, &candidates,
-			opts->mirostat_tau, opts->mirostat_eta,
+			params->mirostat_tau, params->mirostat_eta,
 			&mirostat_mu);
 	} else {
-		llama_sample_top_k(ctx, &candidates, opts->top_k, 1);
-		llama_sample_tail_free(ctx, &candidates, opts->tfs_z, 1);
-		llama_sample_typical(ctx, &candidates, opts->typical_p, 1);
-		llama_sample_top_p(ctx, &candidates, opts->top_p, 1);
-		llama_sample_temp(ctx, &candidates, opts->temperature);
+		llama_sample_top_k(ctx, &candidates, params->top_k, 1);
+		llama_sample_tail_free(ctx, &candidates, params->tfs_z, 1);
+		llama_sample_typical(ctx, &candidates, params->typical_p, 1);
+		llama_sample_top_p(ctx, &candidates, params->top_p, 1);
+		llama_sample_temp(ctx, &candidates, params->temperature);
 		token = llama_sample_token(ctx, &candidates);
 	}
 
@@ -117,7 +115,7 @@ llama_token llama_sample(
 	return token;
 }
 
-void mute_log_handler(enum ggml_log_level level, const char *text, void *user) {
+void llm_go_mute_log_handler(enum ggml_log_level level, const char *text, void *user) {
 	(void)(user);
 
 	// Only allow warnings, errors and things higher than INFO out.
@@ -126,8 +124,8 @@ void mute_log_handler(enum ggml_log_level level, const char *text, void *user) {
     fflush(stderr);
 }
 
-static void mute_llama_log() {
-	llama_log_set(mute_log_handler, NULL);
+static void llm_go_mute() {
+	llama_log_set(llm_go_mute_log_handler, NULL);
 }
 */
 import "C"
@@ -192,16 +190,9 @@ func (m *model) load(modelPath string) error {
 		return fmt.Errorf(`missing n_ctx_train in model %q`, modelPath)
 	}
 	m.nVocab = int(C.llama_n_vocab(m.llama))
-	// TODO: This is.. Dumb.  We should be able to get this directly from the model's vocabulary.
-	lcx := C.llama_new_context_with_model(m.llama, params.context)
-	if lcx == nil {
-		C.llama_free_model(m.llama)
-		return fmt.Errorf("failed to create context from model %q", modelPath)
-	}
-	defer C.llama_free(lcx)
-	m.bos = Token(C.llama_token_bos(lcx)) // TODO: update to use model.
-	m.eos = Token(C.llama_token_eos(lcx)) // TODO: update to use model.
-	m.nl = Token(C.llama_token_nl(lcx))   // TODO: update to use model.
+	m.bos = Token(C.llama_token_bos(m.llama))
+	m.eos = Token(C.llama_token_eos(m.llama))
+	m.nl = Token(C.llama_token_nl(m.llama))
 	return nil
 }
 
@@ -227,7 +218,7 @@ func (m *model) Encode(text string) []Token {
 		(*C.char)(unsafe.Pointer(unsafe.StringData(text))),
 		C.int(len(text)),
 		(*C.int)(unsafe.SliceData(buf)),
-		C.int(len(buf)), false)
+		C.int(len(buf)), false, false) // TODO: do we want to allow tokenizing special tokens as a feature?
 	if n < 0 {
 		panic(errors.New(`llama_tokenize failed`))
 	}
@@ -279,7 +270,7 @@ type stream struct {
 	model  *model // note that this is a borrow of the model, and should not be closed by stream.
 	llama  *C.struct_llama_context
 	params struct {
-		sample C.struct_llama_sample_params
+		sample C.struct_llm_go_params
 	}
 
 	history []Token
@@ -397,7 +388,7 @@ func (s *stream) Next(tokens []Token) (Token, error) {
 
 func (s *stream) sample() (Token, error) {
 	pos := len(s.history) - 1
-	token := C.llama_sample(
+	token := C.llm_go_sample(
 		s.llama,
 		&s.params.sample,
 		C.int(pos),
@@ -423,7 +414,7 @@ func (s *stream) eval(tokens ...Token) error {
 		Interface(`history`, s.history).
 		Interface(`tokens`, tokens).
 		Msg(`evaluating tokens`)
-	e := C.llama_context_eval(s.llama, C.int(len(s.history)), unsafe.SliceData(tokens), C.int(len(tokens)))
+	e := C.llm_go_eval(s.llama, C.int(len(s.history)), unsafe.SliceData(tokens), C.int(len(tokens)))
 	if e == 0 {
 		s.history = append(s.history, tokens...)
 		return nil
@@ -452,20 +443,20 @@ var params = struct {
 	C.llama_context_default_params(),
 }
 
-func applyParameters(opts *C.struct_llama_sample_params, pp *Parameters) {
-	opts.temperature = C.float(pp.Temperature)
-	opts.penalize_newline = C.bool(pp.PenalizeNL)
-	opts.top_k = C.int(pp.TopK)
-	opts.top_p = C.float(pp.TopP)
-	opts.tfs_z = C.float(pp.TFSZ)
-	opts.typical_p = C.float(pp.TypicalP)
-	opts.repeat_penalty = C.float(pp.RepeatPenalty)
-	// TODO opts.repeat_last_n = C.int(pp.RepeatLastN)
-	opts.presence_penalty = C.float(pp.PresencePenalty)
-	opts.frequency_penalty = C.float(pp.FrequencyPenalty)
-	opts.mirostat = C.int(pp.Mirostat)
-	opts.mirostat_tau = C.float(pp.MirostatTau)
-	opts.mirostat_eta = C.float(pp.MirostatEta)
+func applyParameters(params *C.struct_llm_go_params, pp *Parameters) {
+	params.temperature = C.float(pp.Temperature)
+	params.penalize_newline = C.bool(pp.PenalizeNL)
+	params.top_k = C.int(pp.TopK)
+	params.top_p = C.float(pp.TopP)
+	params.tfs_z = C.float(pp.TFSZ)
+	params.typical_p = C.float(pp.TypicalP)
+	params.repeat_penalty = C.float(pp.RepeatPenalty)
+	// TODO params.repeat_last_n = C.int(pp.RepeatLastN)
+	params.presence_penalty = C.float(pp.PresencePenalty)
+	params.frequency_penalty = C.float(pp.FrequencyPenalty)
+	params.mirostat = C.int(pp.Mirostat)
+	params.mirostat_tau = C.float(pp.MirostatTau)
+	params.mirostat_eta = C.float(pp.MirostatEta)
 	if pp.Seed == 0 {
 		for {
 			u := uint32(rand.Int())
@@ -495,9 +486,6 @@ type Parameters struct {
 
 	// NKeep specifies the number of tokens from the initial prompt to retain when the model resets its internal context. By default, this value is set to 0 (meaning no tokens are kept). Use -1 to retain all tokens from the initial prompt.
 	// TODO NKeep int `json:"n_keep"`
-
-	// Stop specifies a JSON array of stopping strings. These words will not be included in the completion, so make sure to add them to the prompt for the next iteration
-	// TODO Stop []string `json:"stop,omitempty"`
 
 	// TFSZ enables tail free sampling with parameter z (default: 1.0, 1.0 = disabled).
 	TFSZ float32 `json:"tfsz"`
@@ -553,5 +541,5 @@ func Defaults() Parameters {
 }
 
 func init() {
-	C.mute_llama_log()
+	C.llm_go_mute()
 }

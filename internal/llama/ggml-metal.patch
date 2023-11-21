@@ -1,6 +1,8 @@
---- /tmp/ggml-metal.m.orig	2023-10-15 09:28:07.671036000 -0700
-+++ internal/llama/ggml-metal.m	2023-10-15 09:33:27.096260205 -0700
-@@ -10,6 +10,8 @@
+diff --git a/internal/llama/ggml-metal.m b/internal/llama/ggml-metal.m
+index a8939c6..f3b0dd6 100644
+--- a/internal/llama/ggml-metal.m
++++ b/internal/llama/ggml-metal.m
+@@ -11,6 +11,8 @@
  
  #import <Metal/Metal.h>
  
@@ -9,7 +11,7 @@
  #undef MIN
  #undef MAX
  #define MIN(a, b) ((a) < (b) ? (a) : (b))
-@@ -198,29 +200,13 @@
+@@ -209,39 +211,12 @@ struct ggml_metal_context * ggml_metal_init(int n_cb) {
          bundle = [NSBundle bundleForClass:[GGMLMetalClass class]];
  #endif
          NSError * error = nil;
@@ -20,8 +22,18 @@
 -            ctx->library = [ctx->device newLibraryWithURL:libURL error:&error];
 -        } else {
 -            GGML_METAL_LOG_INFO("%s: default.metallib not found, loading from source\n", __func__);
- 
--            NSString * sourcePath = [bundle pathForResource:@"ggml-metal" ofType:@"metal"];
+-
+-            NSString * sourcePath;
+-            NSString * ggmlMetalPathResources = [[NSProcessInfo processInfo].environment objectForKey:@"GGML_METAL_PATH_RESOURCES"];
+-            if (ggmlMetalPathResources) {
+-                sourcePath = [ggmlMetalPathResources stringByAppendingPathComponent:@"ggml-metal.metal"];
+-            } else {
+-                sourcePath = [bundle pathForResource:@"ggml-metal" ofType:@"metal"];
+-            }
+-            if (sourcePath == nil) {
+-                GGML_METAL_LOG_WARN("%s: error: could not use bundle path to find ggml-metal.metal, falling back to trying cwd\n", __func__);
+-                sourcePath = @"ggml-metal.metal";
+-            }
 -            GGML_METAL_LOG_INFO("%s: loading '%s'\n", __func__, [sourcePath UTF8String]);
 -            NSString * src = [NSString stringWithContentsOfFile:sourcePath encoding:NSUTF8StringEncoding error:&error];
 -            if (error) {
@@ -32,10 +44,8 @@
 -            MTLCompileOptions* options = nil;
 +        MTLCompileOptions* options = nil;
  #ifdef GGML_QKK_64
--            options = [MTLCompileOptions new];
--            options.preprocessorMacros = @{ @"QK_K" : @(64) };
-+        options = [MTLCompileOptions new];
-+        options.preprocessorMacros = @{ @"QK_K" : @(64) };
+             options = [MTLCompileOptions new];
+             options.preprocessorMacros = @{ @"QK_K" : @(64) };
  #endif
 -            ctx->library = [ctx->device newLibraryWithSource:src options:options error:&error];
 -        }

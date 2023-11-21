@@ -38,9 +38,9 @@ var (
 	cfgModel                    string
 	cfgModelOption              = parser.String(&cfgModel, `model`, `m`, `model to use`)
 	cfgPredictSeed              int
-	cfgPredictSeedOption        = parser.Int(&cfgPredictSeed, `seed`, `s`, `seed for prediction; 0 for random seed`)
+	cfgPredictSeedOption        = parser.Int(&cfgPredictSeed, `seed`, ``, `seed for prediction; 0 for random seed`)
 	cfgPredictTemperature       float64
-	cfgPredictTemperatureOption = parser.Float(&cfgPredictTemperature, `temperature`, `t`, `sampling temperature for prediction; 0 for no randomness`)
+	cfgPredictTemperatureOption = parser.Float(&cfgPredictTemperature, `temperature`, ``, `sampling temperature for prediction; 0 for no randomness`)
 
 	tasks = zugzug.Tasks{
 		{Name: `predict`, Fn: runPredict, Use: `runs a prediction`, Parser: parser.New(

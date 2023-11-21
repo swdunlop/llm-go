@@ -232,6 +232,7 @@ func generateLlamaMetalC(ctx context.Context) error {
 	replacer := strings.NewReplacer(
 		`\`, `\\`,
 		`"`, `\"`,
+		"\uFEFF", ``, // Death to the BOM
 	)
 	for _, line := range lines {
 		out = append(out, "\t\""+replacer.Replace(line)+`\n"`)

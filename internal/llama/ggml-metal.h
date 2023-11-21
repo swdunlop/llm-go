@@ -1,6 +1,6 @@
 // llama.cpp Copyright Georgi Gerganov, 2023, see LICENSE for usage.
-// Fetched from https://github.com/ggerganov/llama.cpp/archive/11bff290458f12f020b588792707f76ec658a27a.tar.gz
-// Commit 11bff290458f12f020b588792707f76ec658a27a
+// Fetched from https://github.com/ggerganov/llama.cpp/archive/0b871f1a04ef60e114bbe43004fd9c21114e802d.tar.gz
+// Commit 0b871f1a04ef60e114bbe43004fd9c21114e802d
 //go:build darwin
 // An interface allowing to compute ggml_cgraph with Metal
 //
@@ -30,7 +30,7 @@
 #include <stdbool.h>
 
 // max memory buffers that can be mapped to the device
-#define GGML_METAL_MAX_BUFFERS 16
+#define GGML_METAL_MAX_BUFFERS 64
 #define GGML_METAL_MAX_COMMAND_BUFFERS 32
 
 struct ggml_tensor;
