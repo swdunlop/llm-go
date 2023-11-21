@@ -7,6 +7,7 @@ package llama
 #cgo darwin CPPFLAGS:  -DGGML_USE_ACCELERATE
 #cgo darwin,arm64 CPPFLAGS: -DGGML_USE_METAL -DGGML_METAL_NDEBUG
 #cgo darwin LDFLAGS: -framework Accelerate -framework Foundation -framework Metal -framework MetalKit -framework MetalPerformanceShaders
+
 #include <stdlib.h>
 #include "ggml-alloc.h"
 #include "llama.h"
@@ -27,63 +28,106 @@ struct llama_sample_params
 	bool penalize_newline;
 };
 
+int llama_context_eval(struct llama_context *ctx, int pos, llama_token *tokens, int n_tokens) {
+	if (n_tokens < 1) return 0;
+	llama_batch batch = llama_batch_init(n_tokens, 0);
+	batch.n_tokens = n_tokens;
+	for (int i = 0; i < n_tokens; i++) {
+		batch.token[i] = tokens[i];
+		batch.pos[i] = pos + i;
+		batch.seq_id[i] = 0;
+		batch.logits[i] = false;
+	}
+	batch.logits[n_tokens - 1] = true;
+	int e = llama_decode(ctx, batch);
+	llama_batch_free(batch);
+	return e;
+}
+
 llama_token llama_sample(
 	struct llama_context *ctx,
-	struct llama_token_data *candidates, size_t n_candidates,
-	const llama_token *last_tokens, size_t n_last_tokens,
-	struct llama_sample_params *opts
+	struct llama_sample_params *opts,
+	int pos,
+	llama_token *last_tokens, int n_last_tokens
 ) {
-	llama_token_data_array candidates_p = {
-		candidates,
-		n_candidates,
-		false,
-	};
+	float *logits = llama_get_logits_ith(ctx, pos);
+	if (logits == NULL) {
+		return 0;
+	}
+	int n_vocab = llama_n_vocab(llama_get_model(ctx));
+	llama_token_data *data = malloc(sizeof(llama_token_data) * n_vocab);
+	if (data == NULL) {
+		return 0;
+	}
+	for (int i = 0; i < n_vocab; i++) {
+		data[i].id = i;
+		data[i].logit = logits[i];
+		data[i].p = 0;
+	}
+	llama_token_data_array candidates = {data, n_vocab, false};
 
 	if (n_last_tokens > 0) {
-		struct llama_token_data newline = candidates_p.data[llama_token_nl(ctx)];
-
 		llama_sample_repetition_penalty(
-			ctx, &candidates_p,
+			ctx, &candidates,
 			last_tokens, n_last_tokens,
-			opts->repeat_penalty);
+			opts->repeat_penalty
+		);
 
 		llama_sample_frequency_and_presence_penalties(
-			ctx, &candidates_p,
+			ctx, &candidates,
 			last_tokens, n_last_tokens,
-			opts->frequency_penalty, opts->presence_penalty);
+			opts->frequency_penalty, opts->presence_penalty
+		);
 
 		if (!opts->penalize_newline) {
-			candidates_p.data[llama_token_nl(ctx)] = newline;
+			struct llama_token_data newline = data[llama_token_nl(ctx)];
+			data[llama_token_nl(ctx)] = newline;
 		}
 	}
 
-	if (opts->temperature <= 0) {
-		return llama_sample_token_greedy(ctx, &candidates_p);
-	}
+	llama_token token = 0;
 
-	if (opts->mirostat == 1) {
+	if (opts->temperature <= 0) {
+		token = llama_sample_token_greedy(ctx, &candidates);
+	} else if (opts->mirostat == 1) {
 		int mirostat_m = 100;
 		float mirostat_mu = 2.0f * opts->mirostat_tau;
-		llama_sample_temp(ctx, &candidates_p, opts->temperature);
-		return llama_sample_token_mirostat(
-			ctx, &candidates_p,
+		llama_sample_temp(ctx, &candidates, opts->temperature);
+		token = llama_sample_token_mirostat(
+			ctx, &candidates,
 			opts->mirostat_tau, opts->mirostat_eta,
 			mirostat_m, &mirostat_mu);
 	} else if (opts->mirostat == 2) {
 		float mirostat_mu = 2.0f * opts->mirostat_tau;
-		llama_sample_temp(ctx, &candidates_p, opts->temperature);
-		return llama_sample_token_mirostat_v2(
-			ctx, &candidates_p,
+		llama_sample_temp(ctx, &candidates, opts->temperature);
+		token = llama_sample_token_mirostat_v2(
+			ctx, &candidates,
 			opts->mirostat_tau, opts->mirostat_eta,
 			&mirostat_mu);
 	} else {
-		llama_sample_top_k(ctx, &candidates_p, opts->top_k, 1);
-		llama_sample_tail_free(ctx, &candidates_p, opts->tfs_z, 1);
-		llama_sample_typical(ctx, &candidates_p, opts->typical_p, 1);
-		llama_sample_top_p(ctx, &candidates_p, opts->top_p, 1);
-		llama_sample_temp(ctx, &candidates_p, opts->temperature);
-		return llama_sample_token(ctx, &candidates_p);
+		llama_sample_top_k(ctx, &candidates, opts->top_k, 1);
+		llama_sample_tail_free(ctx, &candidates, opts->tfs_z, 1);
+		llama_sample_typical(ctx, &candidates, opts->typical_p, 1);
+		llama_sample_top_p(ctx, &candidates, opts->top_p, 1);
+		llama_sample_temp(ctx, &candidates, opts->temperature);
+		token = llama_sample_token(ctx, &candidates);
 	}
+
+	free(data);
+	return token;
+}
+
+void mute_log_handler(enum ggml_log_level level, const char *text, void *user) {
+	(void)(user);
+
+	// Only allow warnings, errors and things higher than INFO out.
+	if (level <= GGML_LOG_LEVEL_INFO) return;
+    fputs(text, stderr);
+    fflush(stderr);
+}
+
+static void mute_llama_log() {
+	llama_log_set(mute_log_handler, NULL);
 }
 */
 import "C"
@@ -155,9 +199,9 @@ func (m *model) load(modelPath string) error {
 		return fmt.Errorf("failed to create context from model %q", modelPath)
 	}
 	defer C.llama_free(lcx)
-	m.bos = Token(C.llama_token_bos(lcx))
-	m.eos = Token(C.llama_token_eos(lcx))
-	m.nl = Token(C.llama_token_nl(lcx))
+	m.bos = Token(C.llama_token_bos(lcx)) // TODO: update to use model.
+	m.eos = Token(C.llama_token_eos(lcx)) // TODO: update to use model.
+	m.nl = Token(C.llama_token_nl(lcx))   // TODO: update to use model.
 	return nil
 }
 
@@ -215,6 +259,7 @@ func (m *model) Predict(log *zerolog.Logger, pp *Parameters, tokens []Token) (St
 	s := m.last.stream
 	m.last.stream = nil
 	m.last.control.Unlock()
+	tokens = append([]Token{m.bos}, tokens...)
 	if s == nil {
 		s = &stream{model: m, log: log}
 		err = s.init(tokens, pp)
@@ -236,17 +281,8 @@ type stream struct {
 	params struct {
 		sample C.struct_llama_sample_params
 	}
-	batch struct {
-		llama  C.struct_llama_batch
-		token  []C.llama_token
-		pos    []C.int
-		seqID  []C.int
-		logits []C.bool
-	}
+
 	history []Token
-	keep    int // number of tokens from the initial context that we must keep
-	ofs     int // offset to the next token to add to the batch, must be <= nBatch (nCtx for now)
-	pos     int // position of the next token to add to the batch, must be <= nCtx
 }
 
 func (s *stream) init(tokens []Token, pp *Parameters) error {
@@ -254,16 +290,15 @@ func (s *stream) init(tokens []Token, pp *Parameters) error {
 
 	cp := params.context
 	cp.n_ctx = C.uint(s.model.nCtx)
-	cp.n_batch = cp.n_ctx // TODO: support nBatch < nCtx
+	cp.n_batch = cp.n_ctx // TODO: support nBatch < nCtx; is nBatch even used?
 	n := len(tokens)
 	max := int(params.context.n_ctx - 5)
 	if n > max {
 		return fmt.Errorf("%v tokens of input exceeds maximum %v tokens", n, max)
 	}
 
-	s.keep = len(tokens)
 	s.history = make([]Token, 0, cp.n_ctx)
-	s.log.Debug().
+	s.log.Trace().
 		Uint(`seed`, uint(pp.Seed)).
 		Int(`nCtx`, s.model.nCtx).Int(`nBatch`, int(cp.n_batch)).
 		Msg(`creating context`)
@@ -273,19 +308,10 @@ func (s *stream) init(tokens []Token, pp *Parameters) error {
 	}
 	C.llama_set_rng_seed(s.llama, C.uint32_t(pp.Seed))
 
-	nctx := int(cp.n_ctx)
-	// TODO: is this the right batch size?
-	batch := C.llama_batch_init(C.int(nctx), 0)
-	s.batch.llama = batch
-	s.batch.token = unsafe.Slice((*C.llama_token)(unsafe.Pointer(batch.token)), nctx)
-	s.batch.pos = unsafe.Slice((*C.int)(unsafe.Pointer(batch.pos)), nctx)
-	s.batch.seqID = unsafe.Slice((*C.int)(unsafe.Pointer(batch.seq_id)), nctx)
-	s.batch.logits = unsafe.Slice((*C.bool)(unsafe.Pointer(batch.logits)), nctx)
-
-	// TODO: support nBatch < nCtx
-	s.accept1(s.model.bos)
-	s.history = s.history[0:0:cap(s.history)] // HACK: This removes the BOS from the history.
-	s.accept(tokens...)
+	err := s.eval(tokens...)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -297,23 +323,28 @@ func (s *stream) reset(tokens []Token, pp *Parameters) error {
 	if n > m {
 		return fmt.Errorf(`%v tokens of input exceeds maximum %v tokens`, len(tokens), cap(s.history))
 	}
-	sz, ofs := kmp.Overlap(tokens, s.history)
-	s.log.Debug().Int(`ofs`, ofs).Int(`sz`, sz).Int(`of`, len(s.history)).Msg(`resetting stream`)
+	sz, pos := kmp.Overlap(tokens, s.history)
+	end := pos + sz
+	s.log.Trace().Int(`history`, len(s.history)).Int(`pos`, pos).Int(`sz`, sz).Msg(`resetting stream`)
 
-	rmCache(s.llama, 0, ofs+sz+1, -1)           // +1 to account for the BOS that is not in our history.
-	shiftCache(s.llama, 0, ofs+1, ofs+sz, -ofs) // +1 to account for the BOS that is not in our history.
-	s.ofs, s.pos = sz, ofs+sz
+	rmCache(s.llama, 0, end, -1)
+	shiftCache(s.llama, 0, pos, end, -pos)
 
-	// do the same for the history.
-	s.history = s.history[0:sz:cap(s.history)]
-	copy(s.history, tokens[:sz])
-	s.accept(tokens[sz:]...)
+	copy(s.history, s.history[pos:])
+	s.history = s.history[:sz]
+	err := s.eval(tokens[sz:]...)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
 // shiftCache moves the range of batch tokens from start to stop by delta.  seqID is generally 0 since we do not use
 // batches concurrently.
 func shiftCache(cache *C.struct_llama_context, seqID int, start, stop int, delta int) {
+	if delta == 0 {
+		return // no movement.
+	}
 	C.llama_kv_cache_seq_shift(cache, C.int(seqID), C.int(start), C.int(stop), C.int(delta))
 }
 
@@ -336,7 +367,6 @@ func (s *stream) Close() {
 }
 
 func (s *stream) free() {
-	C.llama_batch_free(s.batch.llama)
 	C.llama_free(s.llama)
 	s.llama = nil
 }
@@ -347,14 +377,9 @@ func (s *stream) Next(tokens []Token) (Token, error) {
 		return 0, ContextFull{}
 	}
 	// TODO: check for nBatch < nCtx
-	s.accept(tokens...)
-	s.log.Debug().
-		Int(`nCtx`, s.model.nCtx).Int(`ofs`, s.ofs).Int(`pos`, s.pos).
-		Msg(`decoding batch`)
-	s.batch.logits[s.ofs-1] = true // we want logits for the last token;
-	s.batch.llama.n_tokens = C.int(s.ofs)
-	if C.llama_decode(s.llama, s.batch.llama) != 0 {
-		return 0, errors.New("llama_decode failed")
+	err := s.eval(tokens...)
+	if err != nil {
+		return 0, err
 	}
 	token, err := s.sample()
 	if err != nil {
@@ -363,76 +388,50 @@ func (s *stream) Next(tokens []Token) (Token, error) {
 	if token == s.model.eos {
 		return 0, io.EOF
 	}
-	s.ofs = 0 // the next accepted token should be the first token in the next batch.
-	s.accept1(token)
+	err = s.eval(token)
+	if err != nil {
+		return 0, err
+	}
 	return token, nil
 }
 
 func (s *stream) sample() (Token, error) {
-	ref := C.llama_get_logits_ith(s.llama, (s.batch.llama.n_tokens - 1))
-	if ref == nil {
-		return 0, errors.New(`llama failed to produce logits`)
-	}
-	logits := unsafe.Slice(ref, s.model.nVocab)
-	candidates := make([]C.llama_token_data, s.model.nVocab) // TODO: hoist to stream
-	for i, logit := range logits {
-		if logit <= 0 {
-			continue
-		}
-		// TODO: only bother with candidates that have a non-zero logit.
-		candidates = append(candidates, C.llama_token_data{
-			id:    C.int(i),
-			logit: logit,
-			p:     0,
-		})
-	}
-
-	return Token(C.llama_sample(
+	pos := len(s.history) - 1
+	token := C.llama_sample(
 		s.llama,
-		unsafe.SliceData(candidates),
-		C.size_t(len(candidates)),
-		(*C.int)(unsafe.SliceData(s.history)),
-		C.size_t(len(s.history)),
 		&s.params.sample,
-	)), nil
+		C.int(pos),
+		unsafe.SliceData(s.history),
+		C.int(len(s.history)),
+	)
+	s.log.Trace().
+		Int(`pos`, pos).
+		Int(`token`, int(token)).
+		Msg(`sampled token`)
+	if token == 0 {
+		return 0, errors.New(`llama failed to produce a token`)
+	}
+	return Token(token), nil
 }
 
-func (s *stream) accept1(token Token) {
-	s.log.Debug().
-		Int(`nCtx`, s.model.nCtx).Int(`ofs`, s.ofs).Int(`pos`, s.pos).
-		Msg(`batching token`)
-	s.history = append(s.history, token)
-	// TODO: support nBatch < nCtx
-	ofs := s.ofs
-	s.batch.token[ofs] = C.int(token)
-	s.batch.pos[ofs] = C.int(s.pos)
-	s.batch.seqID[ofs] = 0
-	s.batch.logits[ofs] = false
-	s.ofs++
-	s.pos++
-}
-
-func (s *stream) accept(tokens ...Token) {
+func (s *stream) eval(tokens ...Token) error {
 	if len(tokens) == 0 {
-		return
+		return nil
 	}
-	s.log.Debug().
-		Int(`nCtx`, s.model.nCtx).Int(`ofs`, s.ofs).Int(`pos`, s.pos).
-		Int(`tokens`, len(tokens)).
-		Msg(`batching tokens`)
-	ofs := s.ofs
-	pos := C.int(s.pos)
-	for _, token := range tokens {
-		s.history = append(s.history, token)
-		s.batch.token[ofs] = C.llama_token(token)
-		s.batch.pos[ofs] = C.int(pos)
-		s.batch.seqID[ofs] = 0
-		s.batch.logits[ofs] = false
-		ofs++
-		pos++
+	s.log.Trace().
+		// Int(`history`, len(s.history)).
+		Interface(`history`, s.history).
+		Interface(`tokens`, tokens).
+		Msg(`evaluating tokens`)
+	e := C.llama_context_eval(s.llama, C.int(len(s.history)), unsafe.SliceData(tokens), C.int(len(tokens)))
+	if e == 0 {
+		s.history = append(s.history, tokens...)
+		return nil
 	}
-	s.ofs = ofs
-	s.pos = int(pos)
+	if e == 1 {
+		return fmt.Errorf(`eval failed, cache overflow`)
+	}
+	return fmt.Errorf(`eval failed with error %v`, e)
 }
 
 type Token = C.int32_t
@@ -551,4 +550,8 @@ func Defaults() Parameters {
 		MirostatEta:   0.1,
 		Seed:          0,
 	}
+}
+
+func init() {
+	C.mute_llama_log()
 }

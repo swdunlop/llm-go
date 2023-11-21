@@ -98,8 +98,10 @@ func (cfg *config) Decode(tokens []Token) string { return cfg.llama.Decode(token
 
 func (cfg *config) Predict(tokens []Token, options ...predict.Option) (Stream, error) {
 	var stream stream
-	var err error
-	var parameters = llama.Defaults() // TODO: allow parameters to be altered.
+	parameters, err := predict.Parameters(&cfg.parameters, options...)
+	if err != nil {
+		return nil, err
+	}
 	stream.llama, err = cfg.llama.Predict(&cfg.logger, &parameters, tokens)
 	if err != nil {
 		return nil, err

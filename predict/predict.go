@@ -19,6 +19,20 @@ func Parameters(base *llama.Parameters, options ...Option) (llama.Parameters, er
 	return parameters, nil
 }
 
+// Seed specifies the seed for a prediction stream.
+func Seed(seed int) Option {
+	return func(cfg *config) {
+		cfg.parameters.Seed = uint32(seed)
+	}
+}
+
+// Temperature specifies the sampling temperature for a prediction stream.
+func Temperature(temperature float64) Option {
+	return func(cfg *config) {
+		cfg.parameters.Temperature = float32(temperature)
+	}
+}
+
 // JSON applies the JSON used by examples/server in llama.cpp as options to a prediction stream.
 func JSON(msg []byte) Option {
 	return func(cfg *config) {

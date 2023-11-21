@@ -34,12 +34,15 @@ func init() {
 	tasks = append(tasks, zugzug.Tasks{
 		{Name: "bump", Fn: bumpLlama, Use: "bumps llama.cpp to the specified commitish", Parser: parser.New(
 			parser.String(&bumpCommitish, "commitish", "c", "commitish to bump to"),
+			parser.Bool(&noPatch, "no-patch", "", "do not patch the llama.cpp source files aside from adding metadata"),
 		)},
+		{Name: "dev", Fn: runDev, Use: "runs the service locally, restarting on update", Parser: parser.Custom()},
 	}...)
 }
 
 var (
 	bumpCommitish string
+	noPatch       bool
 )
 
 func bumpLlama(ctx context.Context) (err error) {
@@ -238,11 +241,27 @@ func generateLlamaMetalC(ctx context.Context) error {
 }
 
 func patchGgmlMetal(ctx context.Context) error {
+	if noPatch {
+		println(`.. skipping patches`)
+		return nil
+	}
 	err := console.Run(ctx, `patch`, filepath.Join(`internal`, `llama`, `ggml-metal.m`), filepath.Join(`internal`, `llama`, `ggml-metal.patch`))
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+func runDev(ctx context.Context) error {
+	args := []string{
+		`--regex=\.go$`,
+		`--start-service`,
+		`--decoration=none`,
+		`--`,
+		`go`, `run`, `./cmd/llm`, `service`, `-www`, `./www`,
+	}
+	args = append(args, parser.Args(ctx)...)
+	return goRun(ctx, `github.com/cespare/reflex`, args...)
 }
 
 func goRun(ctx context.Context, pkg string, args ...string) error {

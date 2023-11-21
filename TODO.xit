@@ -1,0 +1,28 @@
+Implement a basic web API for the model.
+[x] Move "GET /predict" API to "GET /v0/predict"
+[x] Add "POST /v0/predict" API
+[x] Add "stop" regex array to "POST /v0/predict" API
+[x] Add "stop" regex array to "GET /v0/predict" API
+[x] Add "cmd/llm/api.hurl" to test and demonstrate the APIs.
+[x] Suppress INFO level logging from Llama to stderr.
+[ ] #BUG Correct usage of llama_batch to once per eval.
+[ ] #BUG Repeated service requests with the same input only results in output for the first request.
+[ ] Add "llm get prediction" client for the "GET /predict" API.
+[ ] Add "GET /v0/models" API
+[ ] Add "POST /v0/encode" API 
+[ ] Add "POST /v0/decode" API
+
+Implement a basic web UI for the model.
+[ ] Assemble prosemirror into a text editor with a "predict" action.
+
+Explain how to implement "infinite context" by detecting llm.Overload and shifting the context.
+[ ] Add a Shift method to the llm.Stream interface.
+[ ] Add a Pos method to the llm.Stream interface.
+[ ] Provide an example of infinite context that uses Shift and Pos.
+[ ] Add a "keep" parameter to the "POST /v0/predict" API
+[ ] Add a "keep" parameter to the "GET /v0/predict" API
+
+Implement a "guided" variant of the "GET /v0/predict" API
+[ ] Add a GBNF parameter to the "POST /v0/predict" API
+[ ] Add a GBNF parameter to the "GET /v0/predict" API
+[ ] Add a "guide" parameter to the "GET /v0/predict" API, if true, will wait for guidance after each event.

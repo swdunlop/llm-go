@@ -13,6 +13,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	"github.com/rs/zerolog/pkgerrors"
 	"github.com/swdunlop/llm-go"
+	"github.com/swdunlop/llm-go/predict"
 	"github.com/swdunlop/zugzug-go"
 	"github.com/swdunlop/zugzug-go/zug/parser"
 )
@@ -34,11 +35,18 @@ func main() {
 }
 
 var (
-	cfgModel       string
-	cfgModelOption = parser.String(&cfgModel, `model`, `m`, `model to use`)
-	tasks          = zugzug.Tasks{
+	cfgModel                    string
+	cfgModelOption              = parser.String(&cfgModel, `model`, `m`, `model to use`)
+	cfgPredictSeed              int
+	cfgPredictSeedOption        = parser.Int(&cfgPredictSeed, `seed`, `s`, `seed for prediction; 0 for random seed`)
+	cfgPredictTemperature       float64
+	cfgPredictTemperatureOption = parser.Float(&cfgPredictTemperature, `temperature`, `t`, `sampling temperature for prediction; 0 for no randomness`)
+
+	tasks = zugzug.Tasks{
 		{Name: `predict`, Fn: runPredict, Use: `runs a prediction`, Parser: parser.New(
 			cfgModelOption,
+			cfgPredictSeedOption,
+			cfgPredictTemperatureOption,
 		)},
 		{Name: `encode`, Fn: runEncode, Use: `encodes text as tokens`, Parser: parser.New(
 			cfgModelOption,
@@ -91,7 +99,10 @@ func runDecode(ctx context.Context) error {
 func runPredict(ctx context.Context) error {
 	return withModel(func(m llm.Model) error {
 		tokens := m.Encode(strings.Join(parser.Args(ctx), ` `))
-		s, err := m.Predict(tokens)
+		s, err := m.Predict(tokens,
+			predict.Temperature(cfgPredictTemperature),
+			predict.Seed(cfgPredictSeed),
+		)
 		if err != nil {
 			return err
 		}
@@ -120,7 +131,7 @@ func runPredict(ctx context.Context) error {
 }
 
 func withModel(process func(llm.Model) error) error {
-	m, err := llm.New(cfgModel)
+	m, err := llm.New(cfgModel, llm.Zerolog(zlog.Logger))
 	if err != nil {
 		return err
 	}
