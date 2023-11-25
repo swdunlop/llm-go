@@ -53,7 +53,9 @@ llama_token llm_go_sample(
 	if (logits == NULL) {
 		return 0;
 	}
-	int n_vocab = llama_n_vocab(llama_get_model(ctx));
+	const struct llama_model *model = llama_get_model(ctx);
+	int n_vocab = llama_n_vocab(model);
+
 	llama_token_data *data = malloc(sizeof(llama_token_data) * n_vocab);
 	if (data == NULL) {
 		return 0;
@@ -64,8 +66,6 @@ llama_token llm_go_sample(
 		data[i].p = 0;
 	}
 	llama_token_data_array candidates = {data, n_vocab, false};
-
-	const struct llama_model *model = llama_get_model(ctx);
 
 	if (n_last_tokens > 0) {
 		llama_sample_repetition_penalties(
@@ -168,7 +168,6 @@ type model struct {
 	llama        *C.struct_llama_model
 	bos, eos, nl Token
 	nCtx         int // trained context size
-	nVocab       int // size of the model's vocabulary
 	last         struct {
 		control sync.Mutex
 		stream  *stream
@@ -189,7 +188,6 @@ func (m *model) load(modelPath string) error {
 		C.llama_free_model(m.llama)
 		return fmt.Errorf(`missing n_ctx_train in model %q`, modelPath)
 	}
-	m.nVocab = int(C.llama_n_vocab(m.llama))
 	m.bos = Token(C.llama_token_bos(m.llama))
 	m.eos = Token(C.llama_token_eos(m.llama))
 	m.nl = Token(C.llama_token_nl(m.llama))
@@ -292,6 +290,9 @@ func (s *stream) init(tokens []Token, pp *Parameters) error {
 	s.log.Trace().
 		Uint(`seed`, uint(pp.Seed)).
 		Int(`nCtx`, s.model.nCtx).Int(`nBatch`, int(cp.n_batch)).
+		Int(`bos`, int(s.model.bos)).
+		Int(`nl`, int(s.model.nl)).
+		Int(`eos`, int(s.model.eos)).
 		Msg(`creating context`)
 	s.llama = C.llama_new_context_with_model(s.model.llama, cp)
 	if s.llama == nil {
@@ -541,5 +542,6 @@ func Defaults() Parameters {
 }
 
 func init() {
+	C.llama_backend_init(true) // TODO: are there cases where we want this not to be true?
 	C.llm_go_mute()
 }
