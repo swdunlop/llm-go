@@ -170,7 +170,7 @@ func bumpLlama(ctx context.Context) (err error) {
 	return nil
 }
 
-const mitLicenseHash = `ef78c7e6659e34c798194f0d344e807c722de70cbca1359ef54772661e11ca38`
+const mitLicenseHash = `e562a2ddfaf8280537795ac5ecd34e3012b6582a147ef69ba6a6a5c08c84757d`
 
 func cleanLlama(ctx context.Context) error {
 	dir := filepath.Join(`internal`, `llama`)
