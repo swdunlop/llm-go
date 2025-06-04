@@ -1,7 +1,7 @@
 // llama.cpp Copyright Georgi Gerganov, 2023, see LICENSE for usage.
 // Fetched from https://github.com/ggerganov/llama.cpp/archive/e9c13ff78114af6fc6a4f27cc8dcdda0f3d389fb.tar.gz
 // Commit e9c13ff78114af6fc6a4f27cc8dcdda0f3d389fb
-﻿#pragma once
+#pragma once
 
 #include <cassert>
 #include <stdexcept>
