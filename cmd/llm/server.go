@@ -1,3 +1,6 @@
+//go:build !bump
+// +build !bump
+
 package main
 
 import (

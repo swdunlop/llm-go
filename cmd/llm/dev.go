@@ -89,7 +89,6 @@ func bumpLlama(ctx context.Context) (err error) {
 			return
 		}
 		_ = cleanLlama(ctx)
-		err = fmt.Errorf(`llama.cpp is not licensed under the MIT license; check upstream for updates`)
 	}()
 	for {
 		hdr, err := tr.Next()
